@@ -1,0 +1,108 @@
+# Product categories to monitor on eBay Italy.
+#
+# Per-category knobs (all optional — fall back to `defaults`):
+#   priority      Relative importance. Drives (a) how much of the limited AI
+#                 budget this category gets and (b) alert ranking. Higher = more
+#                 focus. A smartphone at priority 3.0 outranks an accessory at
+#                 0.6 even when the accessory's raw discount is larger.
+#   min_discount  Minimum discount % (vs the bucket baseline) to even consider.
+#                 Lower it for categories where small discounts still matter.
+#   price_scores  Optional discount→score curve overriding the global one in
+#                 scoring.yaml. Use it to make modest discounts "count" more for
+#                 high-value items (a 20%-off phone can score like a 40%-off toy).
+
+defaults:
+  priority: 1.0
+  min_discount: 15
+
+categories:
+  # ── Primary focus: smartphones ──────────────────────────────────────
+  # Query note: "-word" EXCLUDES that word. We keep exclusions for high-volume
+  # accessory categories (case, cover, controller, game) to keep the newest-100
+  # window device-dense, but DON'T exclude words that appear as good-condition
+  # signals in real listings ("con box originale", "vetro applicato", "con
+  # caricatore") — the context-aware classifier in price_tracker.py handles
+  # those precisely instead of bluntly dropping the phone.
+  - name: "iPhones"
+    query: 'iPhone -case -cover -parts -broken'
+    category_id: "9355"
+    min_price: 200
+    max_price: 900
+    priority: 3.0
+    min_discount: 12          # phones: even ~12-15% off is worth a look
+    price_scores:             # reward modest discounts more aggressively
+      - {max_discount: 8,   score: 0}
+      - {max_discount: 15,  score: 50}
+      - {max_discount: 25,  score: 80}
+      - {max_discount: 40,  score: 95}
+      - {max_discount: 100, score: 100}
+
+  - name: "Samsung Galaxy"
+    query: 'Galaxy -case -cover -parts -broken'
+    category_id: "9355"
+    min_price: 150
+    max_price: 800
+    priority: 3.0
+    min_discount: 12
+    price_scores:
+      - {max_discount: 8,   score: 0}
+      - {max_discount: 15,  score: 50}
+      - {max_discount: 25,  score: 80}
+      - {max_discount: 40,  score: 95}
+      - {max_discount: 100, score: 100}
+
+  # ── Secondary focus: PS5 ────────────────────────────────────────────
+  - name: "PlayStation 5"
+    query: 'PS5 -controller -game -gioco -parts -broken -bridge'
+    category_id: "139971"
+    min_price: 150
+    max_price: 450
+    priority: 2.5
+    min_discount: 14
+    price_scores:
+      - {max_discount: 8,   score: 0}
+      - {max_discount: 16,  score: 45}
+      - {max_discount: 28,  score: 80}
+      - {max_discount: 45,  score: 95}
+      - {max_discount: 100, score: 100}
+
+  # ── Everything else: default sensitivity, lower priority ────────────
+  - name: "MacBooks"
+    query: 'MacBook -cover -parts -broken'
+    category_id: "111422"
+    min_price: 300
+    max_price: 1500
+    priority: 1.5
+    min_discount: 15
+
+  - name: "Xbox Series X"
+    query: 'Xbox Series X -controller -game -gioco -parts -broken'
+    category_id: "139971"
+    min_price: 150
+    max_price: 400
+    priority: 1.5
+    min_discount: 15
+
+  - name: "iPads"
+    query: 'iPad -case -cover -parts -broken'
+    category_id: "171485"
+    min_price: 150
+    max_price: 800
+    priority: 1.0
+    min_discount: 15
+
+  - name: "Nintendo Switch"
+    query: 'Nintendo Switch -game -gioco -controller -joycon -parts -broken'
+    category_id: "139971"
+    min_price: 100
+    max_price: 350
+    priority: 1.0
+    min_discount: 18
+
+  - name: "AirPods"
+    query: 'AirPods -case -cover -parts -broken -only -singola'
+    category_id: "112529"
+    min_price: 50
+    max_price: 300
+    priority: 0.6           # de-prioritized — needs a real bargain to surface
+    min_discount: 25

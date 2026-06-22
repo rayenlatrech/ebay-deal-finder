@@ -1,0 +1,51 @@
+# Deal scoring weights (must sum to 1.0)
+weights:
+  price: 0.35
+  condition: 0.25
+  seller: 0.20
+  image: 0.10
+  listing_quality: 0.10
+
+# Alert thresholds
+thresholds:
+  hot_deal: 80
+  good_deal: 60
+  log_only: 40
+
+# Price discount → score mapping
+price_scores:
+  - max_discount: 10
+    score: 0
+  - max_discount: 20
+    score: 30
+  - max_discount: 35
+    score: 60
+  - max_discount: 50
+    score: 85
+  - max_discount: 100
+    score: 100
+
+# Stock photo scoring penalties
+stock_photo_penalties:
+  used_item_stock: -25
+  new_item_stock: -10
+  uncertain: -5
+
+# Seller trust tiers
+seller_tiers:
+  high:
+    min_sales: 100
+    min_positive_pct: 98.0
+    score: 95
+  medium:
+    min_sales: 50
+    min_positive_pct: 95.0
+    score: 70
+  low_new:
+    min_sales: 0
+    min_positive_pct: 0.0
+    score: 40
+  low_bad:
+    min_sales: 0
+    max_positive_pct: 95.0
+    score: 20

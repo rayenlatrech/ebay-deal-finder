@@ -1,0 +1,33 @@
+# General settings (all secrets come from environment variables)
+ebay:
+  marketplace: "EBAY_IT"
+  buying_options: "FIXED_PRICE"
+  results_per_page: 50
+  max_pages_per_category: 2
+
+ai:
+  primary_provider: "gemini"
+  fallback_provider: "groq"
+  gemini_model: "gemini-2.5-flash"
+  groq_model: "llama-3.3-70b-versatile"
+  max_image_analyses_per_run: 20
+  max_text_analyses_per_run: 50
+
+scanning:
+  min_discount_for_ai: 10
+  min_discount_for_alert: 15
+
+telegram:
+  batch_good_deals: true
+  send_scan_report: true
+
+# Longitudinal sold-price tracking (builds the resale dataset over time).
+tracking:
+  enabled: true
+  stale_hours: 24            # re-check a listing only after this long unseen
+  max_reconcile_checks: 120  # cap getItem liveness checks per run (quota guard)
+  max_track_days: 90         # stop tracking a listing after this long
+  sold_max_days: 60          # ended within this window => proxy "sold"
+  retention_days: 150        # keep raw sold_comps this long, then roll up + drop
+  min_comps: 3               # min comps before a resale_stats bucket is trusted
+  stats_refresh_hours: 20    # rebuild resale_stats at most this often
