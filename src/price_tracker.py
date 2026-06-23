@@ -19,50 +19,31 @@ from src.db import Database
 
 logger = logging.getLogger(__name__)
 
-# ── Base product family detection ────────────────────────────────────────
-FAMILY_PATTERNS = {
-    "iphone": re.compile(r"iphone\s*(\d{1,2})", re.IGNORECASE),
-    "galaxy": re.compile(r"galaxy\s*(s\d{1,2}|a\d{1,2}|note\s*\d{1,2}|z\s*(?:fold|flip)\s*\d?)", re.IGNORECASE),
-    "macbook": re.compile(r"macbook\s*(pro|air)?\s*(m\d(?:\s*pro|\s*max)?|\d{4})?", re.IGNORECASE),
-    "ipad": re.compile(r"ipad\s*(pro|air|mini)?\s*(m\d|\d{1,2}th|\d{4})?", re.IGNORECASE),
-    "ps5": re.compile(r"(?:ps5|playstation\s*5)", re.IGNORECASE),
-    "xbox": re.compile(r"xbox\s*series\s*(x|s)", re.IGNORECASE),
-    "switch": re.compile(r"switch", re.IGNORECASE),
-    "airpods": re.compile(r"airpods", re.IGNORECASE),
-}
+# ── Family anchors (ordered; first hit wins) ─────────────────────────────
+# Detection is split from key-building: each family applies its own variant /
+# chip / screen-size logic in the dedicated _*_key builders below, because a
+# single regex can't robustly handle e.g. "iPhone Air", "MacBook 15 M4", or
+# "Switch 2" where the price-defining token sits anywhere in the title.
+FAMILY_ANCHORS = [
+    ("iphone", re.compile(r"\biphone\b", re.IGNORECASE)),
+    ("galaxy", re.compile(r"\bgalaxy\b", re.IGNORECASE)),
+    ("macbook", re.compile(r"\bmacbook\b", re.IGNORECASE)),
+    ("ipad", re.compile(r"\bipad\b", re.IGNORECASE)),
+    ("ps5", re.compile(r"(?:\bps5\b|playstation\s*5)", re.IGNORECASE)),
+    ("xbox", re.compile(r"xbox\s*series", re.IGNORECASE)),
+    ("switch", re.compile(r"\bswitch\b", re.IGNORECASE)),
+    ("airpods", re.compile(r"\bairpods\b", re.IGNORECASE)),
+]
 
-# ── Sub-variant classification (modifiers that change the core product) ───
-# Evaluated top-to-bottom; first match wins, so more specific variants
-# (e.g. "pro max" before "pro") MUST come first.
-VARIANT_PATTERNS = {
-    "iphone": [
-        (re.compile(r"pro\s*max", re.IGNORECASE), "_pro_max"),
-        (re.compile(r"\bpro\b", re.IGNORECASE), "_pro"),
-        (re.compile(r"\bplus\b|\+", re.IGNORECASE), "_plus"),
-        (re.compile(r"\bmini\b", re.IGNORECASE), "_mini"),
-    ],
-    "galaxy": [
-        (re.compile(r"ultra", re.IGNORECASE), "_ultra"),
-        (re.compile(r"plus|\+", re.IGNORECASE), "_plus"),
-        (re.compile(r"\bfe\b", re.IGNORECASE), "_fe"),
-    ],
-    "ps5": [
-        (re.compile(r"portal", re.IGNORECASE), "_portal"),
-        (re.compile(r"(controller|dualsense)", re.IGNORECASE), "_controller"),
-        (re.compile(r"\bpro\b", re.IGNORECASE), "_pro"),
-        (re.compile(r"(slim|digital)", re.IGNORECASE), "_slim"),
-        (re.compile(r"(console|standard)", re.IGNORECASE), "_console"),
-    ],
-    "switch": [
-        (re.compile(r"oled", re.IGNORECASE), "_oled"),
-        (re.compile(r"lite", re.IGNORECASE), "_lite"),
-        (re.compile(r"joycon|joy-con|controller", re.IGNORECASE), "_controller"),
-    ],
-    "airpods": [
-        (re.compile(r"max", re.IGNORECASE), "_max"),
-        (re.compile(r"\bpro\b", re.IGNORECASE), "_pro"),
-    ],
-}
+# Apple-silicon chip — the #1 MacBook/iPad price driver. Extracted globally
+# from the whole title because sellers put it before OR after the screen size.
+CHIP_PATTERN = re.compile(r"\bm([1-5])(?:\s*(pro|max|ultra))?\b", re.IGNORECASE)
+
+# Screen sizes, normalised (Apple rebranded 10.9"->11", 12.9"->13"). The
+# negative lookahead stops "16 GB" of RAM/storage being read as a 16" screen.
+MAC_SIZE_PATTERN = re.compile(r"\b(13|14|15|16)\b(?!\s*(?:gb|tb))", re.IGNORECASE)
+IPAD_SIZE_13 = re.compile(r"\b(?:12\.9|13)\b(?!\s*(?:gb|tb))", re.IGNORECASE)
+IPAD_SIZE_11 = re.compile(r"\b(?:10\.9|11)\b(?!\s*(?:gb|tb))", re.IGNORECASE)
 
 # Accessory / spare-part nouns. Presence alone is NOT enough — see
 # _is_accessory_listing for the position/context logic that avoids nuking
@@ -288,60 +269,28 @@ class PriceTracker:
 
         Returns (product_key, confidence 0.0-1.0).
         """
-        title_lower = title.lower().strip()
+        t = title.lower().strip()
 
-        # ── Stage 1: Family detection ──
-        matched_family = None
-        fam_start = len(title_lower)
-        base_key_parts: list[str] = []
-
-        for family, pattern in FAMILY_PATTERNS.items():
-            match = pattern.search(title_lower)
-            if match:
-                matched_family = family
-                fam_start = match.start()
-                base_key_parts.append(family)
-                for group in match.groups():
-                    if group:
-                        cleaned = group.strip().replace(" ", "_")
-                        if cleaned and cleaned not in base_key_parts:
-                            base_key_parts.append(cleaned)
-                break
-
-        if not matched_family:
-            # Fall back to eBay's catalog id for listings we can't parse.
+        family, fam_start = self._detect_family(t)
+        if not family:
             if epid:
                 return (f"epid_{epid}", 0.9)
             return ("", 0.0)
 
-        # ── Stage 2: Variant classification ──
-        variant_suffix = ""
-        if matched_family in VARIANT_PATTERNS:
-            for pattern, suffix in VARIANT_PATTERNS[matched_family]:
-                if pattern.search(title_lower):
-                    variant_suffix = suffix
-                    break
+        core_key, variant_suffix = self._build_key(family, t)
+        if not core_key:
+            # Recognized the family but couldn't pin the model (e.g. "iPhone"
+            # with no number). Fall back to eBay's catalog id if present.
+            if epid:
+                return (f"epid_{epid}", 0.9)
+            return ("", 0.0)
 
-        # A bare PS5 with no explicit variant is a standard console.
-        if matched_family == "ps5" and not variant_suffix:
-            variant_suffix = "_console"
-
-        # ── Storage extraction ──
-        storage_suffix = ""
-        storage_match = STORAGE_PATTERN.search(title_lower)
-        if storage_match:
-            size = storage_match.group(1)
-            unit = storage_match.group(2).lower()
-            storage_suffix = f"_{size}{unit}"
-
-        final_key = "_".join(base_key_parts) + variant_suffix + storage_suffix
-        final_key = re.sub(r"_+", "_", final_key).strip("_")
+        final_key = re.sub(r"_+", "_", core_key).strip("_")
 
         # ── Accessory / part disambiguation (position + context aware) ──
         is_part, recognized_variant = self._is_accessory_listing(
-            title_lower, fam_start, variant_suffix
+            t, fam_start, variant_suffix
         )
-
         if recognized_variant:
             confidence = 0.97
         elif is_part:
@@ -353,6 +302,167 @@ class PriceTracker:
             confidence = 0.95
 
         return final_key, confidence
+
+    # ── Family detection & key building ──────────────────────────────
+
+    @staticmethod
+    def _detect_family(t: str) -> Tuple[Optional[str], int]:
+        for family, anchor in FAMILY_ANCHORS:
+            m = anchor.search(t)
+            if m:
+                return family, m.start()
+        return None, len(t)
+
+    @staticmethod
+    def _storage_suffix(t: str) -> str:
+        m = STORAGE_PATTERN.search(t)
+        return f"_{m.group(1)}{m.group(2).lower()}" if m else ""
+
+    @staticmethod
+    def _chip_suffix(t: str) -> str:
+        m = CHIP_PATTERN.search(t)
+        if not m:
+            return ""
+        tier = m.group(2)
+        return f"_m{m.group(1)}" + (f"_{tier.lower()}" if tier else "")
+
+    def _build_key(self, family: str, t: str) -> Tuple[str, str]:
+        """Return (core_key, recognized_variant).
+
+        recognized_variant is only set to '_controller'/'_portal' so the
+        accessory check treats those as legitimate product buckets; '' otherwise.
+        """
+        if family == "ps5":
+            return self._ps5_key(t)
+        if family == "switch":
+            return self._switch_key(t)
+        builders = {
+            "iphone": self._iphone_key,
+            "galaxy": self._galaxy_key,
+            "macbook": self._mac_key,
+            "ipad": self._ipad_key,
+            "xbox": self._xbox_key,
+            "airpods": self._airpods_key,
+        }
+        builder = builders.get(family)
+        return (builder(t) if builder else ""), ""
+
+    def _iphone_key(self, t: str) -> str:
+        # "iPhone Air" is its own model (no number); unify "iPhone 17 Air" with it.
+        if re.search(r"\bair\b", t):
+            return "iphone_air" + self._storage_suffix(t)
+        m = re.search(r"iphone\s*(\d{1,2})", t)
+        if not m:
+            return ""
+        num = m.group(1)
+        base = f"iphone_{num}"
+        if re.search(r"pro\s*max", t):
+            base += "_pro_max"
+        elif re.search(r"\bpro\b", t):
+            base += "_pro"
+        elif re.search(r"\bplus\b|\+", t):
+            base += "_plus"
+        elif re.search(r"\bmini\b", t):
+            base += "_mini"
+        elif re.search(rf"\b{num}e\b", t):  # 16e / 17e budget models (attached 'e')
+            base += "_e"
+        return base + self._storage_suffix(t)
+
+    def _galaxy_key(self, t: str) -> str:
+        m = re.search(
+            r"galaxy\s*(s\d{1,2}|a\d{1,2}|note\s*\d{1,2}|z\s*(?:fold|flip)\s*\d?)", t
+        )
+        if not m:
+            return ""
+        base = "galaxy_" + re.sub(r"\s+", "_", m.group(1).strip())
+        if re.search(r"\bedge\b", t):
+            base += "_edge"
+        elif re.search(r"ultra", t):
+            base += "_ultra"
+        elif re.search(r"plus|\+", t):
+            base += "_plus"
+        elif re.search(r"\bfe\b", t):
+            base += "_fe"
+        return base + self._storage_suffix(t)
+
+    def _mac_key(self, t: str) -> str:
+        m = re.search(r"macbook\s*(pro|air)?", t)
+        line = m.group(1) if (m and m.group(1)) else ""
+        base = "macbook" + (f"_{line}" if line else "")
+        size = MAC_SIZE_PATTERN.search(t)
+        size_suffix = f"_{size.group(1)}" if size else ""
+        return base + self._chip_suffix(t) + size_suffix + self._storage_suffix(t)
+
+    def _ipad_key(self, t: str) -> str:
+        m = re.search(r"ipad\s*(pro|air|mini)?", t)
+        line = m.group(1) if (m and m.group(1)) else ""
+        extra = self._chip_suffix(t)
+        if line in ("pro", "air"):
+            if IPAD_SIZE_13.search(t):
+                extra += "_13"
+            elif IPAD_SIZE_11.search(t):
+                extra += "_11"
+        elif not line:
+            # Bare iPad: the generation number is the price differentiator.
+            gm = re.search(r"ipad\s*(\d{1,2})", t)
+            if gm:
+                extra += f"_gen{gm.group(1)}"
+        base = "ipad" + (f"_{line}" if line else "")
+        return base + extra + self._storage_suffix(t)
+
+    def _ps5_key(self, t: str) -> Tuple[str, str]:
+        if re.search(r"portal", t):
+            variant, recognized = "_portal", "_portal"
+        elif re.search(r"controller|dualsense", t):
+            variant, recognized = "_controller", "_controller"
+        elif re.search(r"\bpro\b", t):
+            variant, recognized = "_pro", ""
+        elif re.search(r"slim|digital", t):
+            variant, recognized = "_slim", ""
+        else:
+            variant, recognized = "_console", ""
+        return "ps5" + variant + self._storage_suffix(t), recognized
+
+    def _xbox_key(self, t: str) -> str:
+        m = re.search(r"xbox\s*series\s*(x|s)", t)
+        if not m:
+            return ""
+        base = f"xbox_{m.group(1)}"
+        if re.search(r"\bdigital\b", t):
+            base += "_digital"
+        return base + self._storage_suffix(t)
+
+    def _switch_key(self, t: str) -> Tuple[str, str]:
+        recognized = ""
+        if re.search(r"switch\s*2\b", t):
+            variant = "_2"
+        elif re.search(r"oled", t):
+            variant = "_oled"
+        elif re.search(r"lite", t):
+            variant = "_lite"
+        elif re.search(r"joy-?con|controller", t):
+            variant, recognized = "_controller", "_controller"
+        else:
+            variant = ""
+        return "switch" + variant + self._storage_suffix(t), recognized
+
+    def _airpods_key(self, t: str) -> str:
+        if re.search(r"\bmax\b", t):
+            return "airpods_max"
+        if re.search(r"pro\s*3", t):
+            return "airpods_pro_3"
+        if re.search(r"pro\s*2", t):
+            return "airpods_pro_2"
+        if re.search(r"\bpro\b", t):
+            return "airpods_pro"
+        if re.search(r"\b4\b", t):
+            anc = "_anc" if re.search(r"anc|noise|cancellaz|cancelling|riduzione", t) else ""
+            return "airpods_4" + anc
+        if re.search(r"\b3\b", t):
+            return "airpods_3"
+        if re.search(r"\b2\b", t):
+            return "airpods_2"
+        return "airpods"
 
     # ── Price trend (now backed by persisted history) ─────────────────
 
