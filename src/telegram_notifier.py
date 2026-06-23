@@ -242,7 +242,7 @@ class TelegramNotifier:
         if errors > 0:
             lines.append(f"❌ Errors: {errors}")
 
-        lines.append("\n⏰ Next scan in ~6 hours")
+        lines.append("\n⏰ Next scan in ~4 hours")
         return self._send_message("\n".join(lines))
 
     # ── Error Alert ──────────────────────────────────────────────────
