@@ -125,14 +125,21 @@ class TelegramNotifier:
         price = listing.get("price", 0)
         avg_price = scores.get("avg_price", 0)
         discount_pct = scores.get("discount_pct", 0)
+        baseline_source = scores.get("baseline_source", "market")
+        new_price = scores.get("new_price")
+        ebay_avg = scores.get("ebay_avg")
         trust_level = scores.get("seller_trust_level", "unknown")
 
         lines = [
             "🔥 <b>HOT DEAL FOUND!</b>",
             "",
             f"📱 {self._esc(listing.get('title', 'Unknown'))}",
-            f"💰 Price: €{price:.0f} (Market avg: €{avg_price:.0f}, <b>{discount_pct:.0f}% OFF</b>)",
+            f"💰 Price: €{price:.0f} (€{avg_price:.0f} {self._esc(baseline_source)}, <b>{discount_pct:.0f}% OFF</b>)",
         ]
+        # When anchored to the new price, show the eBay asking figure too, so an
+        # inflated asking-median is visible rather than hidden.
+        if new_price and ebay_avg and ebay_avg > new_price * 1.05:
+            lines.append(f"   ℹ️ eBay asking avg was €{ebay_avg:.0f} (used new price as the anchor)")
 
         if listing.get("negotiable"):
             lines.append("🤝 Price may be negotiable (Make Offer available)")

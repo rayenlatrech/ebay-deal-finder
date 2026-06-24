@@ -140,6 +140,10 @@ def run_pipeline() -> None:
         global_min_discount = settings["scanning"].get("min_discount_for_ai", 15)
         max_ai_analyses = settings["ai"].get("max_text_analyses_per_run", 50)
 
+        # Manually-curated new/street prices — used as a baseline ceiling so an
+        # inflated eBay asking-median can't invent a deal (see the A57 case).
+        reference_prices = db.get_reference_prices()
+
         candidates = []
         for listing in listings:
             # Drop "for parts / not working" units before they reach the funnel
@@ -169,10 +173,20 @@ def run_pipeline() -> None:
             cat_min_discount = cat_cfg.get("min_discount", global_min_discount)
             cat_price_scores = cat_cfg.get("price_scores")  # None => global curve
 
+            # Anchor the baseline to the curated new price (a hard ceiling): a
+            # used item can't be worth more than its current new price.
+            ref = reference_prices.get(product_key)
+            new_price = float(ref["new_price"]) if ref and ref.get("new_price") else None
+            baseline = avg_price
+            baseline_source = "eBay market"
+            if new_price and 0 < new_price < avg_price:
+                baseline = new_price
+                baseline_source = "new price"
+
             # Calculate preliminary discount using Total Price (Price + Shipping)
             total_price = listing.get("total_price", listing["price"])
             price_score, discount_pct, is_suspicious = scorer.calculate_price_score(
-                total_price, avg_price, cat_price_scores
+                total_price, baseline, cat_price_scores
             )
 
             if discount_pct < cat_min_discount:
@@ -188,7 +202,10 @@ def run_pipeline() -> None:
             candidates.append({
                 "listing": listing,
                 "product_key": product_key,
-                "avg_price": avg_price,
+                "avg_price": baseline,          # effective baseline used for scoring
+                "ebay_avg": avg_price,          # raw eBay asking baseline
+                "new_price": new_price,         # curated new price, if any
+                "baseline_source": baseline_source,
                 "price_score": price_score,
                 "discount_pct": discount_pct,
                 "is_suspicious": is_suspicious,
@@ -345,6 +362,9 @@ def run_pipeline() -> None:
                     "listing_quality": listing_quality,
                     "stock_penalty": stock_penalty,
                     "avg_price": candidate["avg_price"],
+                    "ebay_avg": candidate["ebay_avg"],
+                    "new_price": candidate["new_price"],
+                    "baseline_source": candidate["baseline_source"],
                     "discount_pct": candidate["discount_pct"],
                     "is_suspicious": candidate["is_suspicious"],
                     "seller_trust_level": seller_trust_level,

@@ -10,6 +10,7 @@ the funnel depends entirely on this module:
 """
 
 import logging
+import math
 import re
 import statistics
 from collections import Counter
@@ -89,8 +90,12 @@ class PriceTracker:
     MIN_CONFIDENCE = 0.8
     # Robust current-run samples needed to trust a brand-new baseline.
     MIN_SAMPLES = 3
-    # How many recent saved medians to blend into the baseline.
+    # How many recent saved baselines to blend into the current one.
     HISTORY_WINDOW = 8
+    # Asking prices are right-skewed (overpriced listings sit unsold), so the
+    # median over-states the real market. A lower percentile approximates
+    # "what you'd actually pay" much better. See the A57 reference-price note.
+    BASELINE_PERCENTILE = 35
 
     def __init__(self, db: Database) -> None:
         """Initialize with database client."""
@@ -158,6 +163,20 @@ class PriceTracker:
 
         return [p for p, e in pairs if e == top_epid or not e]
 
+    @staticmethod
+    def _percentile(values: list[float], pct: float) -> Optional[float]:
+        """Linear-interpolated percentile (pct in 0-100). None if empty."""
+        if not values:
+            return None
+        s = sorted(values)
+        if len(s) == 1:
+            return float(s[0])
+        rank = (len(s) - 1) * (pct / 100.0)
+        lo, hi = math.floor(rank), math.ceil(rank)
+        if lo == hi:
+            return float(s[int(rank)])
+        return float(s[lo] + (s[hi] - s[lo]) * (rank - lo))
+
     def update_market_prices(self, listings: list[dict]) -> dict[str, float]:
         """Compute and store robust median baselines for the current scan.
 
@@ -188,10 +207,11 @@ class PriceTracker:
             prices = self._purge_minority_epids(pairs)
             # Layer 2 (statistical): trim price outliers.
             robust = self._reject_outliers(prices)
-            current_median = statistics.median(robust) if robust else None
+            # Layer 3: lower percentile, not median, to counter asking-price skew.
+            current_value = self._percentile(robust, self.BASELINE_PERCENTILE) if robust else None
 
-            if current_median is not None:
-                self.db.save_price_point(key, round(current_median, 2), len(robust))
+            if current_value is not None:
+                self.db.save_price_point(key, round(current_value, 2), len(robust))
 
             # Blend across recent runs (history already includes the point we
             # just saved) to smooth out thin, noisy single-scan samples.
@@ -200,7 +220,7 @@ class PriceTracker:
                 float(h["avg_price"]) for h in history[: self.HISTORY_WINDOW]
                 if h.get("avg_price") is not None
             ]
-            pool = hist_points or ([current_median] if current_median is not None else [])
+            pool = hist_points or ([current_value] if current_value is not None else [])
             if not pool:
                 continue
             baseline = statistics.median(pool)

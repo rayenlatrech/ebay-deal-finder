@@ -345,3 +345,34 @@ class Database:
             self.client.table(table).delete().lt(column, cutoff_iso).execute()
         except Exception as e:
             logger.error("Retention delete failed on %s.%s: %s", table, column, e)
+
+    # ── Reference prices (manually-curated new/street prices) ─────────
+
+    def get_reference_prices(self) -> dict[str, dict]:
+        """All reference prices keyed by product_key (used by the scanner)."""
+        try:
+            resp = self.client.table("reference_prices").select("*").execute()
+            return {r["product_key"]: r for r in (resp.data or [])}
+        except Exception as e:
+            logger.error("Failed to load reference prices: %s", e)
+            return {}
+
+    def upsert_reference_price(self, record: dict[str, Any]) -> None:
+        """Insert/update one reference price; refreshes updated_at (= verified now)."""
+        record = {**record, "updated_at": datetime.now(timezone.utc).isoformat()}
+        self.client.table("reference_prices").upsert(
+            record, on_conflict="product_key"
+        ).execute()
+
+    def delete_reference_price(self, product_key: str) -> None:
+        """Remove a reference price."""
+        self.client.table("reference_prices").delete().eq("product_key", product_key).execute()
+
+    def get_observed_product_keys(self, limit: int = 1000) -> list[str]:
+        """Distinct product_keys currently being tracked (to help fill prices)."""
+        try:
+            resp = self.client.table("tracked_listings").select("product_key").limit(limit).execute()
+            return sorted({r["product_key"] for r in (resp.data or []) if r.get("product_key")})
+        except Exception as e:
+            logger.error("Failed to load observed product keys: %s", e)
+            return []

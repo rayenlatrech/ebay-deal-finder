@@ -76,8 +76,9 @@ except Exception as exc:  # noqa: BLE001 - surface any config/connection issue
 st.title("🔍 eBay AI Deal Finder — Control Panel")
 st.caption("Changes are saved to Supabase and picked up on the scanner's next run.")
 
-tab_watchlist, tab_curves, tab_deals, tab_resale = st.tabs(
-    ["⚙️ Watchlist", "📈 Discount curves", "🔥 Recent deals", "📦 Resale data"]
+tab_watchlist, tab_curves, tab_reference, tab_deals, tab_resale = st.tabs(
+    ["⚙️ Watchlist", "📈 Discount curves", "💶 Reference prices",
+     "🔥 Recent deals", "📦 Resale data"]
 )
 
 
@@ -276,6 +277,94 @@ with tab_deals:
             )
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Could not load recent deals: {exc}")
+
+
+# ── Tab: Reference prices (manual weekly new-price anchor) ────────────────
+
+with tab_reference:
+    st.markdown(
+        "Enter the current **new / street price** (from idealo, trovaprezzi, "
+        "Amazon, …) for the models you track. The scanner caps each bucket's "
+        "baseline at this price, so an inflated eBay asking-median can't invent "
+        "a fake deal, and alerts show **% below new**.\n\n"
+        "↻ **Refresh weekly** — rows older than 7 days are flagged below. "
+        "Saving a row stamps it as verified now."
+    )
+
+    STALE_DAYS = 7
+    ref_map = db.get_reference_prices()
+    ref_rows = list(ref_map.values())
+
+    # Compute staleness for display.
+    now = pd.Timestamp.now(tz="UTC")
+    display = []
+    stale_count = 0
+    for r in ref_rows:
+        updated = r.get("updated_at")
+        try:
+            age_days = (now - pd.Timestamp(updated)).days if updated else None
+        except Exception:  # noqa: BLE001
+            age_days = None
+        if age_days is not None and age_days >= STALE_DAYS:
+            stale_count += 1
+        display.append({
+            "product_key": r.get("product_key", ""),
+            "new_price": r.get("new_price"),
+            "source": r.get("source", ""),
+            "age_days": age_days,
+        })
+
+    if stale_count:
+        st.warning(f"⚠️ {stale_count} price(s) are {STALE_DAYS}+ days old — time to refresh them.")
+
+    if not display:
+        display = [{"product_key": "", "new_price": None, "source": "", "age_days": None}]
+
+    df = pd.DataFrame(display)
+    original_keys = {r.get("product_key") for r in ref_rows if r.get("product_key")}
+
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="reference_editor",
+        column_config={
+            "product_key": st.column_config.TextColumn(
+                "Product key", help="Exact classifier bucket, e.g. galaxy_a57_256gb"
+            ),
+            "new_price": st.column_config.NumberColumn("New price €", min_value=0, step=10),
+            "source": st.column_config.TextColumn("Source", help="idealo / trovaprezzi / amazon"),
+            "age_days": st.column_config.NumberColumn("Age (days)", disabled=True),
+        },
+    )
+
+    if st.button("💾 Save reference prices", type="primary"):
+        kept = set()
+        for _, row in edited.iterrows():
+            key = (str(row["product_key"]).strip() if row["product_key"] is not None else "")
+            if not key or key.lower() == "nan":
+                continue
+            price = _clean_num(row["new_price"])
+            if price is None:
+                st.warning(f"'{key}' has no price — skipped.")
+                continue
+            kept.add(key)
+            db.upsert_reference_price({
+                "product_key": key,
+                "new_price": price,
+                "source": str(row["source"] or "").strip() or None,
+            })
+        for gone in original_keys - kept:
+            db.delete_reference_price(gone)
+        st.success(f"Saved {len(kept)} reference price(s).")
+        st.rerun()
+
+    with st.expander("🔑 Product keys seen recently (copy the exact key)"):
+        keys = db.get_observed_product_keys()
+        if keys:
+            st.code("\n".join(keys))
+        else:
+            st.caption("No tracked listings yet — run a scan first.")
 
 
 # ── Tab 4: Resale dataset (watch it mature) ───────────────────────────────

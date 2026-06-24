@@ -133,6 +133,17 @@ def test_iqr_noop_on_small_samples():
     assert PriceTracker._reject_outliers([100, 900]) == [100, 900]
 
 
+def test_percentile_is_below_median_for_skewed_asking_prices():
+    # Right-skewed asking prices: the 35th percentile must sit below the median,
+    # pulling the baseline toward what you'd actually pay.
+    prices = [400, 420, 430, 450, 600, 650]
+    p35 = PriceTracker._percentile(prices, 35)
+    median = PriceTracker._percentile(prices, 50)
+    assert p35 < median
+    assert PriceTracker._percentile([500], 35) == 500
+    assert PriceTracker._percentile([], 35) is None
+
+
 # ── ePID purity guard ─────────────────────────────────────────────────────
 
 def test_epid_guard_drops_minority_catalog_product():
