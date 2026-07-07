@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -174,8 +175,12 @@ def run_pipeline() -> None:
             cat_price_scores = cat_cfg.get("price_scores")  # None => global curve
 
             # Anchor the baseline to the curated new price (a hard ceiling): a
-            # used item can't be worth more than its current new price.
+            # used item can't be worth more than its current new price. Try the
+            # exact key, then fall back to the model without storage so one entry
+            # (e.g. "iphone_15") covers every storage tier.
             ref = reference_prices.get(product_key)
+            if not ref:
+                ref = reference_prices.get(re.sub(r"_\d+(gb|tb)$", "", product_key))
             new_price = float(ref["new_price"]) if ref and ref.get("new_price") else None
             baseline = avg_price
             baseline_source = "eBay market"

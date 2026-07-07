@@ -52,7 +52,8 @@ IPAD_SIZE_11 = re.compile(r"\b(?:10\.9|11)\b(?!\s*(?:gb|tb))", re.IGNORECASE)
 ACCESSORY_KEYWORDS = re.compile(
     r"(charger|caricabatterie|caricatore|alimentatore|cable|cavo|screen|schermo|"
     r"display|lcd|vetro|glass|battery|batteria|motherboard|scheda|case|cover|"
-    r"box|scatola|empty|vuota|vuoto|parts|ricambi|ricambio|adapter|adattatore)",
+    r"box|scatola|empty|vuota|vuoto|parts|ricambi|ricambio|adapter|adattatore|"
+    r"disc\s*drive|disk\s*drive|disc\s*reader|lettore\s*dischi|lettore\s*ottico)",
     re.IGNORECASE,
 )
 
