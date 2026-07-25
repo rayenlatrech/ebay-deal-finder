@@ -21,6 +21,9 @@ class DealScorer:
         self.price_scores = self.config["price_scores"]
         self.stock_penalties = self.config["stock_photo_penalties"]
         self.seller_tiers = self.config["seller_tiers"]
+        # Too-good-to-be-true guard: past a certain discount, a listing is more
+        # likely a scam than a bargain, so it must stop earning more points.
+        self.suspicious = self.config.get("suspicious_price", {})
         logger.info("Deal scorer loaded with weights: %s", self.weights)
 
 
@@ -60,8 +63,13 @@ class DealScorer:
                 score = tier["score"]
                 break
 
-        # Flag suspiciously low prices (>50% off)
-        is_suspicious = discount_pct > 50
+        # Flag suspiciously low prices. Beyond this point a bigger discount is
+        # evidence of a scam, not of a better deal, so cap the reward instead of
+        # letting the price score keep climbing to 100.
+        threshold = self.suspicious.get("threshold_pct", 50)
+        is_suspicious = discount_pct > threshold
+        if is_suspicious:
+            score = min(score, self.suspicious.get("max_price_score", 60))
 
         return score, round(discount_pct, 1), is_suspicious
 
@@ -144,6 +152,7 @@ class DealScorer:
         image_score: int,
         listing_quality_score: int,
         stock_photo_penalty: int = 0,
+        is_suspicious: bool = False,
     ) -> int:
         """Calculate weighted composite deal score (0-100).
 
@@ -154,6 +163,7 @@ class DealScorer:
             image_score: Image verification score (0-100)
             listing_quality_score: Description/photo completeness (0-100)
             stock_photo_penalty: Negative penalty for stock photos
+            is_suspicious: Price is implausibly low — apply the scam penalty
         """
         raw = (
             price_score * self.weights["price"]
@@ -163,8 +173,11 @@ class DealScorer:
             + listing_quality_score * self.weights["listing_quality"]
         )
 
-        # Apply stock photo penalty
-        final = max(0, min(100, int(raw + stock_photo_penalty)))
+        penalty = stock_photo_penalty
+        if is_suspicious:
+            penalty += self.suspicious.get("penalty", -25)
+
+        final = max(0, min(100, int(raw + penalty)))
         return final
 
     # ── Classification ───────────────────────────────────────────────

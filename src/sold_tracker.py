@@ -21,7 +21,9 @@ import statistics
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from src.price_tracker import PriceTracker, is_for_parts
+from src.price_tracker import (
+    PriceTracker, is_for_parts, condition_band, PRICED_BANDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,32 +35,6 @@ def _now() -> datetime:
 def _parse(ts: str) -> datetime:
     """Parse a Supabase ISO timestamp (handles trailing 'Z')."""
     return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-
-
-def condition_band(listing: dict) -> str:
-    """Collapse eBay's condition into a coarse band that drives resale value.
-
-    Resale value depends heavily on condition, but eBay's used grades are thin
-    ("Usato"/"Used" with no sub-grade), so a few bands are all we can trust.
-    """
-    cid = str(listing.get("condition_id", "") or "")
-    text = (listing.get("condition", "") or "").lower()
-
-    by_id = {
-        "1000": "new",
-        "1500": "refurb", "2000": "refurb", "2010": "refurb",
-        "2020": "refurb", "2030": "refurb", "2500": "refurb",
-        "7000": "parts",
-    }
-    if cid in by_id:
-        return by_id[cid]
-    if any(s in text for s in ("nuovo", "brand new", "sigillat")):
-        return "new"
-    if any(s in text for s in ("rigenerat", "refurb", "ricondizionat", "open box")):
-        return "refurb"
-    if any(s in text for s in ("ricambi", "parts", "non funzionante")):
-        return "parts"
-    return "used"
 
 
 class SoldTracker:
@@ -87,7 +63,10 @@ class SoldTracker:
         now_iso = _now().isoformat()
         records = []
         for it in listings:
-            if is_for_parts(it):
+            band = condition_band(it)
+            # Refurb and parts are excluded from the resale dataset too, so the
+            # realized-price stats stay comparable to the deal baselines.
+            if is_for_parts(it) or band not in PRICED_BANDS:
                 continue
             key, conf = self.price_tracker.generate_product_key(
                 it.get("title", ""), it.get("category", ""),
@@ -103,7 +82,7 @@ class SoldTracker:
             records.append({
                 "id": it["item_id"],
                 "product_key": key,
-                "condition_band": condition_band(it),
+                "condition_band": band,
                 "price": round(price, 2),
                 "status": "active",
                 "last_seen": now_iso,

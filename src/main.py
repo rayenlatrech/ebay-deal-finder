@@ -78,7 +78,10 @@ def run_pipeline() -> None:
     from src.ebay_client import EbayClient
     from src.ai_analyzer import AIAnalyzer
     from src.deal_scorer import DealScorer
-    from src.price_tracker import PriceTracker, is_for_parts
+    from src.price_tracker import (
+        PriceTracker, is_for_parts, condition_band, baseline_key,
+        PRICED_BANDS,
+    )
     from src.sold_tracker import SoldTracker
     from src.telegram_notifier import TelegramNotifier
 
@@ -144,11 +147,20 @@ def run_pipeline() -> None:
         # Manually-curated new/street prices — used as a baseline ceiling so an
         # inflated eBay asking-median can't invent a deal (see the A57 case).
         reference_prices = db.get_reference_prices()
+        ref_cfg = settings.get("reference", {})
+        band_factor = {
+            "used": ref_cfg.get("used_factor", 0.75),
+            "new": ref_cfg.get("new_factor", 1.00),
+        }
+
+        # Listings already alerted on, fetched once instead of per-listing.
+        alerted_ids = db.get_alerted_ids([l["item_id"] for l in listings])
 
         candidates = []
         for listing in listings:
-            # Drop "for parts / not working" units before they reach the funnel
-            if is_for_parts(listing):
+            # Drop for-parts and refurbished units before they reach the funnel.
+            band = condition_band(listing)
+            if is_for_parts(listing) or band not in PRICED_BANDS:
                 stats["skipped"] += 1
                 continue
 
@@ -163,7 +175,9 @@ def run_pipeline() -> None:
                 stats["skipped"] += 1
                 continue
 
-            avg_price = market_prices.get(product_key)
+            # Compare like with like: a used unit against the used baseline,
+            # a sealed one against the sealed baseline.
+            avg_price = market_prices.get(baseline_key(product_key, band))
             if not avg_price:
                 stats["skipped"] += 1
                 continue
@@ -174,19 +188,29 @@ def run_pipeline() -> None:
             cat_min_discount = cat_cfg.get("min_discount", global_min_discount)
             cat_price_scores = cat_cfg.get("price_scores")  # None => global curve
 
-            # Anchor the baseline to the curated new price (a hard ceiling): a
-            # used item can't be worth more than its current new price. Try the
-            # exact key, then fall back to the model without storage so one entry
-            # (e.g. "iphone_15") covers every storage tier.
-            ref = reference_prices.get(product_key)
-            if not ref:
-                ref = reference_prices.get(re.sub(r"_\d+(gb|tb)$", "", product_key))
+            # ── New-price ceiling ────────────────────────────────────
+            # Priority 1: curated retail price (exact key, then without storage
+            # so one entry covers every storage tier).
+            ref = reference_prices.get(product_key) or reference_prices.get(
+                re.sub(r"_\d+(gb|tb)$", "", product_key)
+            )
             new_price = float(ref["new_price"]) if ref and ref.get("new_price") else None
+            ceiling_source = "retail"
+            # Priority 2 (free, automatic, optional): eBay's own NEW-condition
+            # baseline for this bucket — asking prices, not true retail, so it's
+            # only a fallback and can be disabled in settings.yaml.
+            if new_price is None and ref_cfg.get("use_ebay_new_fallback", True):
+                new_price = market_prices.get(baseline_key(product_key, "new"))
+                ceiling_source = "eBay new"
+
+            # A used unit can't be worth full retail, so scale the ceiling.
             baseline = avg_price
-            baseline_source = "eBay market"
-            if new_price and 0 < new_price < avg_price:
-                baseline = new_price
-                baseline_source = "new price"
+            baseline_source = f"{band} market"
+            if new_price:
+                ceiling = new_price * band_factor.get(band, 1.0)
+                if 0 < ceiling < avg_price:
+                    baseline = ceiling
+                    baseline_source = f"{ceiling_source} anchor"
 
             # Calculate preliminary discount using Total Price (Price + Shipping)
             total_price = listing.get("total_price", listing["price"])
@@ -200,11 +224,12 @@ def run_pipeline() -> None:
                 continue
 
             # Skip if already alerted
-            if db.was_alerted(listing["item_id"]):
+            if listing["item_id"] in alerted_ids:
                 stats["skipped"] += 1
                 continue
 
             candidates.append({
+                "band": band,
                 "listing": listing,
                 "product_key": product_key,
                 "avg_price": baseline,          # effective baseline used for scoring
@@ -242,7 +267,12 @@ def run_pipeline() -> None:
                 # Get full item details for description
                 details = ebay.get_item_details(listing["item_id"])
                 if details:
+                    shipping = listing.get("shipping_cost", 0.0) or 0.0
                     listing.update(details)
+                    # get_item_details overwrites `price` but carries no shipping,
+                    # so recompute the total to keep the two consistent.
+                    listing["shipping_cost"] = shipping
+                    listing["total_price"] = float(listing.get("price", 0)) + shipping
 
                 # Enrich listing with price context for the AI prompt
                 listing["avg_price"] = candidate["avg_price"]
@@ -346,6 +376,7 @@ def run_pipeline() -> None:
                     image_score=image_score,
                     listing_quality_score=listing_quality,
                     stock_photo_penalty=stock_penalty,
+                    is_suspicious=candidate["is_suspicious"],
                 )
 
                 deal_class = scorer.classify_deal(deal_score)
@@ -370,6 +401,7 @@ def run_pipeline() -> None:
                     "ebay_avg": candidate["ebay_avg"],
                     "new_price": candidate["new_price"],
                     "baseline_source": candidate["baseline_source"],
+                    "condition_band": candidate["band"],
                     "discount_pct": candidate["discount_pct"],
                     "is_suspicious": candidate["is_suspicious"],
                     "seller_trust_level": seller_trust_level,
@@ -429,9 +461,13 @@ def run_pipeline() -> None:
 
         # ── Send Batched Good Deals ──────────────────────────────────
         if good_deals and settings["telegram"].get("batch_good_deals", True):
-            telegram.send_deal_summary(good_deals)
-            for deal in good_deals:
-                db.mark_alerted(deal["listing"]["item_id"])
+            # Only mark as alerted if the summary actually went out, otherwise
+            # a failed send would silently bury these listings forever.
+            if telegram.send_deal_summary(good_deals):
+                for deal in good_deals:
+                    db.mark_alerted(deal["listing"]["item_id"])
+            else:
+                logger.warning("Deal summary failed to send — not marking as alerted")
 
         # ── Step 9: Resale tracking maintenance (never breaks a scan) ─
         try:

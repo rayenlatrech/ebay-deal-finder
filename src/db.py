@@ -98,6 +98,30 @@ class Database:
             logger.error("Failed to check alert status for %s: %s", item_id, e)
             return False
 
+    def get_alerted_ids(self, item_ids: list[str]) -> set[str]:
+        """Which of these listings have already been alerted on.
+
+        Batched (chunked) so a scan costs a couple of queries instead of one
+        round-trip per listing.
+        """
+        found: set[str] = set()
+        unique = list({i for i in item_ids if i})
+        CHUNK = 200
+        for start in range(0, len(unique), CHUNK):
+            chunk = unique[start:start + CHUNK]
+            try:
+                resp = (
+                    self.client.table("analyses")
+                    .select("listing_id")
+                    .in_("listing_id", chunk)
+                    .eq("alerted", True)
+                    .execute()
+                )
+                found.update(r["listing_id"] for r in (resp.data or []))
+            except Exception as e:
+                logger.error("Failed to batch-check alert status: %s", e)
+        return found
+
     def mark_alerted(self, item_id: str) -> None:
         """Mark the most recent analysis for a listing as alerted."""
         try:

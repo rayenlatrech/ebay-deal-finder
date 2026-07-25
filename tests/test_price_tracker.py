@@ -7,7 +7,9 @@ regresses, the market baseline silently corrupts and every downstream decision
 
 import pytest
 
-from src.price_tracker import PriceTracker, is_for_parts
+from src.price_tracker import (
+    PriceTracker, is_for_parts, condition_band, baseline_key, PRICED_BANDS,
+)
 
 
 @pytest.fixture
@@ -108,6 +110,30 @@ def test_unparseable_falls_back_to_epid(tracker):
 
 
 # ── for-parts detection ───────────────────────────────────────────────────
+
+@pytest.mark.parametrize("listing,expected_band", [
+    ({"condition_id": "1000"}, "new"),
+    ({"condition_id": "3000"}, "used"),
+    ({"condition_id": "2000"}, "refurb"),
+    ({"condition_id": "7000"}, "parts"),
+    ({"condition": "Nuovo (altro)"}, "new"),
+    ({"condition": "Ricondizionato"}, "refurb"),
+    ({"condition": "Usato"}, "used"),
+])
+def test_condition_band(listing, expected_band):
+    assert condition_band(listing) == expected_band
+
+
+def test_refurb_is_excluded_from_priced_bands():
+    # Sealed/new stays a tradeable band; refurb and parts never get a baseline.
+    assert "new" in PRICED_BANDS and "used" in PRICED_BANDS
+    assert "refurb" not in PRICED_BANDS
+    assert "parts" not in PRICED_BANDS
+
+
+def test_baseline_key_separates_new_from_used():
+    assert baseline_key("iphone_15", "new") != baseline_key("iphone_15", "used")
+
 
 @pytest.mark.parametrize("listing,expected", [
     ({"condition_id": "7000"}, True),

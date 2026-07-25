@@ -44,6 +44,26 @@ def test_suspiciously_low_price_flagged(scorer):
     assert suspicious is True
 
 
+def test_absurd_discount_does_not_out_score_a_strong_one(scorer):
+    # The core scam-guard: past the suspicion threshold the price score is
+    # capped, so an 85%-off listing can no longer beat a healthy 40%-off one.
+    strong, _, strong_susp = scorer.calculate_price_score(60.0, 100.0)   # 40% off
+    absurd, _, absurd_susp = scorer.calculate_price_score(15.0, 100.0)   # 85% off
+    assert strong_susp is False
+    assert absurd_susp is True
+    assert absurd <= strong
+
+
+def test_suspicious_penalty_applied_to_composite(scorer):
+    kwargs = dict(
+        price_score=100, condition_score=95, seller_score=70,
+        image_score=85, listing_quality_score=60, stock_photo_penalty=0,
+    )
+    clean = scorer.calculate_composite_score(**kwargs)
+    flagged = scorer.calculate_composite_score(**kwargs, is_suspicious=True)
+    assert flagged < clean
+
+
 def test_overpriced_scores_zero(scorer):
     score, discount, _ = scorer.calculate_price_score(120.0, 100.0)
     assert score == 0

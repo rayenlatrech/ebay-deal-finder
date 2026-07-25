@@ -122,7 +122,10 @@ class TelegramNotifier:
     ) -> bool:
         """Send a detailed alert for a hot deal (score >= 80)."""
         deal_score = scores.get("deal_score", 0)
-        price = listing.get("price", 0)
+        # Show the total actually paid — the discount is computed on it, so
+        # displaying the base price alone made the maths look wrong.
+        price = listing.get("total_price") or listing.get("price", 0)
+        shipping = listing.get("shipping_cost", 0) or 0
         avg_price = scores.get("avg_price", 0)
         discount_pct = scores.get("discount_pct", 0)
         baseline_source = scores.get("baseline_source", "market")
@@ -136,6 +139,11 @@ class TelegramNotifier:
             f"📱 {self._esc(listing.get('title', 'Unknown'))}",
             f"💰 Price: €{price:.0f} (€{avg_price:.0f} {self._esc(baseline_source)}, <b>{discount_pct:.0f}% OFF</b>)",
         ]
+        if shipping:
+            lines.append(f"   📦 incl. €{shipping:.0f} shipping")
+        band = scores.get("condition_band")
+        if band:
+            lines.append(f"   🏷️ Compared against <b>{self._esc(band)}</b> listings")
         # When anchored to the new price, show the eBay asking figure too, so an
         # inflated asking-median is visible rather than hidden.
         if new_price and ebay_avg and ebay_avg > new_price * 1.05:

@@ -71,6 +71,43 @@ STORAGE_PATTERN = re.compile(r"(\d+)\s*(gb|tb)", re.IGNORECASE)
 # eBay conditionId for "For parts or not working"
 FOR_PARTS_CONDITION_ID = "7000"
 
+# Condition bands we build baselines for. Sealed/new units are kept as their
+# own tracked band (a sealed unit under retail is a genuine deal), but they are
+# never mixed with used prices. Refurbished is excluded entirely — its pricing
+# is a different market and it pollutes both bands.
+PRICED_BANDS = ("new", "used")
+EXCLUDED_BANDS = ("refurb", "parts")
+
+
+def condition_band(listing: dict) -> str:
+    """Collapse eBay's condition into a coarse band that drives resale value.
+
+    Returns one of: 'new', 'refurb', 'used', 'parts'.
+    """
+    cid = str(listing.get("condition_id", "") or "")
+    text = (listing.get("condition", "") or "").lower()
+
+    by_id = {
+        "1000": "new",
+        "1500": "refurb", "2000": "refurb", "2010": "refurb",
+        "2020": "refurb", "2030": "refurb", "2500": "refurb",
+        "7000": "parts",
+    }
+    if cid in by_id:
+        return by_id[cid]
+    if any(s in text for s in ("rigenerat", "refurb", "ricondizionat", "open box")):
+        return "refurb"
+    if any(s in text for s in ("nuovo", "brand new", "sigillat", "new")):
+        return "new"
+    if any(s in text for s in ("ricambi", "parts", "non funzionante")):
+        return "parts"
+    return "used"
+
+
+def baseline_key(product_key: str, band: str) -> str:
+    """Composite bucket id so 'new' and 'used' never share a baseline."""
+    return f"{product_key}#{band}"
+
 
 def is_for_parts(listing: dict) -> bool:
     """True if eBay marks the listing as 'for parts / not working'.
@@ -179,17 +216,22 @@ class PriceTracker:
         return float(s[lo] + (s[hi] - s[lo]) * (rank - lo))
 
     def update_market_prices(self, listings: list[dict]) -> dict[str, float]:
-        """Compute and store robust median baselines for the current scan.
+        """Compute and store robust baselines for the current scan, per condition.
 
-        Pipeline per bucket: drop for-parts units → reject IQR outliers →
-        median → persist → blend with recent history. Only buckets with enough
-        support (current samples or prior history) are returned.
+        Buckets are keyed by ``product_key#band`` so sealed/new and used units
+        never share a baseline (mixing them made used items look like deals and
+        new items look overpriced). Refurbished is excluded outright.
+
+        Pipeline per bucket: ePID purge → IQR outlier rejection → low percentile
+        → persist → blend with recent history. Only buckets with enough support
+        (current samples or prior history) are returned.
         """
         # bucket -> list of (price, epid)
         groups: dict[str, list[tuple[float, str]]] = {}
 
         for listing in listings:
-            if is_for_parts(listing):
+            band = condition_band(listing)
+            if band not in PRICED_BANDS:
                 continue
             key, confidence = self.generate_product_key(
                 listing.get("title", ""),
@@ -200,7 +242,7 @@ class PriceTracker:
             price = float(listing.get("total_price") or listing.get("price") or 0)
             if key and confidence >= self.MIN_CONFIDENCE and price > 0:
                 epid = str(listing.get("epid", "") or "")
-                groups.setdefault(key, []).append((price, epid))
+                groups.setdefault(baseline_key(key, band), []).append((price, epid))
 
         baselines: dict[str, float] = {}
         for key, pairs in groups.items():

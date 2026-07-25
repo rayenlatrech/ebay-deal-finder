@@ -25,6 +25,14 @@ price_scores:
   - max_discount: 100
     score: 100
 
+# Too-good-to-be-true guard. Past `threshold_pct` off, a listing is more likely
+# a scam than a bargain: the price score stops climbing (capped) and the
+# composite takes a penalty, so absurd discounts can no longer top the ranking.
+suspicious_price:
+  threshold_pct: 55
+  max_price_score: 60
+  penalty: -25
+
 # Stock photo scoring penalties
 stock_photo_penalties:
   used_item_stock: -25

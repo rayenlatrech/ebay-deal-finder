@@ -17,6 +17,20 @@ scanning:
   min_discount_for_ai: 10
   min_discount_for_alert: 15
 
+# New-price ceiling. A used unit can't be worth its full new price, so the
+# ceiling is scaled per condition band before being used as a baseline.
+# Sources, in priority order: manually-curated reference_prices (true retail),
+# then eBay's own NEW-condition baseline for the same bucket (free, automatic).
+reference:
+  used_factor: 0.75    # a used unit at 75% of new is "at market", not a deal
+  new_factor: 1.00     # a sealed unit below retail IS a genuine deal
+  # Fall back to eBay's own NEW-condition baseline when a model has no curated
+  # retail price. These are third-party ASKING prices, not true retail — often
+  # above it, occasionally below. Safe because the anchor only ever *lowers* a
+  # baseline (it can suppress a deal, never invent one). Set false to rely
+  # exclusively on the manually-curated reference_prices table.
+  use_ebay_new_fallback: true
+
 telegram:
   batch_good_deals: true
   send_scan_report: true
