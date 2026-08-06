@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.deal_scorer import DealScorer
+from src.deal_scorer import DealScorer, is_trusted_seller
 
 
 @pytest.fixture
@@ -62,6 +62,25 @@ def test_suspicious_penalty_applied_to_composite(scorer):
     clean = scorer.calculate_composite_score(**kwargs)
     flagged = scorer.calculate_composite_score(**kwargs, is_suspicious=True)
     assert flagged < clean
+
+
+@pytest.mark.parametrize("pct,sales,expected", [
+    (99.0, 500, True),    # established and well rated
+    (95.0, 10,  True),    # exactly on the bar
+    (100.0, 1,  False),   # perfect score, no track record
+    (100.0, 9,  False),   # still too few completed sales
+    (94.9, 5000, False),  # huge volume but rating below the bar
+    (0, 0, False),
+])
+def test_is_trusted_seller(pct, sales, expected):
+    listing = {"seller_feedback_percentage": pct, "seller_feedback_score": sales}
+    assert is_trusted_seller(listing) is expected
+
+
+def test_is_trusted_seller_handles_missing_fields():
+    assert is_trusted_seller({}) is False
+    assert is_trusted_seller({"seller_feedback_percentage": None,
+                              "seller_feedback_score": None}) is False
 
 
 def test_overpriced_scores_zero(scorer):

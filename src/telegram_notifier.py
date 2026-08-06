@@ -99,6 +99,18 @@ class TelegramNotifier:
         """Build a safe HTML anchor (URL escaped for the href attribute)."""
         return f'<a href="{html.escape(str(url), quote=True)}">{TelegramNotifier._esc(text)}</a>'
 
+    # ── Marketplace / trust badges ───────────────────────────────────
+
+    MARKETPLACE_FLAGS = {
+        "EBAY_IT": "🇮🇹", "EBAY_DE": "🇩🇪", "EBAY_FR": "🇫🇷",
+        "EBAY_NL": "🇳🇱", "EBAY_BE": "🇧🇪", "EBAY_ES": "🇪🇸",
+    }
+
+    @classmethod
+    def _flag(cls, marketplace: str) -> str:
+        """Country flag for a marketplace id (blank if unknown)."""
+        return cls.MARKETPLACE_FLAGS.get(str(marketplace or "").upper(), "")
+
     # ── Trust Emoji ──────────────────────────────────────────────────
 
     @staticmethod
@@ -133,10 +145,17 @@ class TelegramNotifier:
         ebay_avg = scores.get("ebay_avg")
         trust_level = scores.get("seller_trust_level", "unknown")
 
+        flag = self._flag(scores.get("marketplace", ""))
+        header = "🔥 <b>HOT DEAL FOUND!</b>"
+        if scores.get("seller_trusted"):
+            header += "  ⭐ <b>TRUSTED SELLER</b>"
+        if scores.get("is_foreign"):
+            header += f"\n🌍 Cross-border {flag} — ships to Italy"
+
         lines = [
-            "🔥 <b>HOT DEAL FOUND!</b>",
+            header,
             "",
-            f"📱 {self._esc(listing.get('title', 'Unknown'))}",
+            f"📱 {flag} {self._esc(listing.get('title', 'Unknown'))}".strip(),
             f"💰 Price: €{price:.0f} (€{avg_price:.0f} {self._esc(baseline_source)}, <b>{discount_pct:.0f}% OFF</b>)",
         ]
         if shipping:
@@ -206,37 +225,61 @@ class TelegramNotifier:
 
     # ── Batched Good Deals Summary ───────────────────────────────────
 
+    def _deal_line(self, index: int, deal: dict[str, Any]) -> str:
+        """Render one deal as a summary row."""
+        listing = deal.get("listing", {})
+        scores = deal.get("scores", {})
+        title = str(listing.get("title", "Unknown"))[:50]
+        price = listing.get("total_price") or listing.get("price", 0)
+        discount = scores.get("discount_pct", 0)
+        score = scores.get("deal_score", 0)
+        url = listing.get("item_url", "")
+        flag = self._flag(scores.get("marketplace", ""))
+
+        link = self._link(title, url) if url else self._esc(title)
+        line = f"{index}. {flag} {link} — €{price:.0f} ({discount:.0f}% off) — Score: {score}"
+
+        if listing.get("negotiable"):
+            line += " 🤝"
+        if deal.get("analysis", {}).get("photo_type", "") == "stock":
+            line += " 📷"
+        return line
+
     def send_deal_summary(self, deals: list[dict[str, Any]]) -> bool:
-        """Send a compact summary of good deals (score 60-79)."""
+        """Send a good-deals summary, split by seller trust.
+
+        Deals from established, well-rated sellers are listed first in their own
+        section — those are the ones worth acting on quickly. Everything else
+        follows in a second section so it's visible but clearly de-emphasised.
+        """
         if not deals:
             return True
 
+        trusted = [d for d in deals if d.get("scores", {}).get("seller_trusted")]
+        others = [d for d in deals if not d.get("scores", {}).get("seller_trusted")]
+
         lines = [
-            "📊 <b>eBay Italy Deal Summary</b>",
+            "📊 <b>eBay Deal Summary</b>",
             f"Found {len(deals)} good deal{'s' if len(deals) != 1 else ''}:",
-            "",
         ]
 
-        for i, deal in enumerate(deals, 1):
-            listing = deal.get("listing", {})
-            scores = deal.get("scores", {})
-            title = str(listing.get("title", "Unknown"))[:50]
-            price = listing.get("price", 0)
-            discount = scores.get("discount_pct", 0)
-            score = scores.get("deal_score", 0)
-            url = listing.get("item_url", "")
+        counter = 1
+        if trusted:
+            lines.extend(["", "⭐ <b>TRUSTED SELLERS</b> — established, 95%+ positive"])
+            for deal in trusted:
+                lines.append(self._deal_line(counter, deal))
+                counter += 1
 
-            link = self._link(title, url) if url else self._esc(title)
-            line = f"{i}. 👍 {link} — €{price:.0f} ({discount:.0f}% off) — Score: {score}"
+        if others:
+            lines.extend(["", "🔎 <b>OTHER SELLERS</b> — verify before buying"])
+            for deal in others:
+                lines.append(self._deal_line(counter, deal))
+                counter += 1
 
-            if listing.get("negotiable"):
-                line += " 🤝"
-            if deal.get("analysis", {}).get("photo_type", "") == "stock":
-                line += " 📷"
-
-            lines.append(line)
-
-        lines.extend(["", "🤝 = Make Offer available | 📷 = Stock photo"])
+        lines.extend([
+            "",
+            "🤝 = Make Offer | 📷 = Stock photo | 🌍 flags show the eBay site",
+        ])
         return self._send_message("\n".join(lines))
 
     # ── Scan Report ──────────────────────────────────────────────────

@@ -4,6 +4,23 @@ ebay:
   buying_options: "FIXED_PRICE"
   results_per_page: 50
   max_pages_per_category: 2
+  # Cross-border marketplaces searched in addition to the home one. Only
+  # listings that ship to `ship_to_country` are returned, and — because
+  # cross-border returns and disputes are far harder — a foreign listing is
+  # dropped entirely unless its seller clears the `seller_trust` bar below.
+  foreign_marketplaces:
+    - EBAY_DE
+    - EBAY_FR
+    - EBAY_NL
+    - EBAY_BE
+  ship_to_country: "IT"
+
+# "Trusted seller" definition — an established seller with a strong record.
+# Used twice: as a hard gate on cross-border listings, and to split the
+# Telegram summary into trusted vs. other sections.
+seller_trust:
+  min_positive_pct: 95.0
+  min_sales: 10
 
 ai:
   primary_provider: "gemini"

@@ -7,6 +7,31 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Default "trusted seller" bar, overridable via settings.yaml → seller_trust.
+DEFAULT_MIN_POSITIVE_PCT = 95.0
+DEFAULT_MIN_SALES = 10
+
+
+def is_trusted_seller(
+    listing: dict[str, Any],
+    min_positive_pct: float = DEFAULT_MIN_POSITIVE_PCT,
+    min_sales: int = DEFAULT_MIN_SALES,
+) -> bool:
+    """True if the seller is established *and* well-rated.
+
+    "Established" means a real track record of completed sales, not just a
+    perfect score from two transactions — a 100% rating over 1 sale carries far
+    less information than 98% over 500. Used as a hard gate on cross-border
+    listings (where returns and disputes are harder) and to split alerts into
+    trusted vs. other sections.
+    """
+    try:
+        pct = float(listing.get("seller_feedback_percentage") or 0)
+        sales = int(listing.get("seller_feedback_score") or 0)
+    except (TypeError, ValueError):
+        return False
+    return pct >= min_positive_pct and sales >= min_sales
+
 
 class DealScorer:
     """Scores listings by combining price, condition, seller, image, and quality signals."""

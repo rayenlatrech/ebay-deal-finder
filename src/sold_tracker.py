@@ -83,6 +83,7 @@ class SoldTracker:
                 "id": it["item_id"],
                 "product_key": key,
                 "condition_band": band,
+                "marketplace": it.get("marketplace") or None,
                 "price": round(price, 2),
                 "status": "active",
                 "last_seen": now_iso,
@@ -128,7 +129,9 @@ class SoldTracker:
         finalized = 0
         for row in rows:
             age_days = (now - _parse(row["first_seen"])).days
-            active = ebay.item_is_active(row["id"])
+            # Check against the listing's own marketplace, otherwise a live
+            # foreign item 404s on the home site and is recorded as sold.
+            active = ebay.item_is_active(row["id"], marketplace=row.get("marketplace"))
 
             # Still active and not too old: reset its clock, keep tracking.
             if active is True and age_days < self.max_track_days:

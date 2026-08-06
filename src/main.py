@@ -77,7 +77,7 @@ def run_pipeline() -> None:
     from src.db import Database
     from src.ebay_client import EbayClient
     from src.ai_analyzer import AIAnalyzer
-    from src.deal_scorer import DealScorer
+    from src.deal_scorer import DealScorer, is_trusted_seller
     from src.price_tracker import (
         PriceTracker, is_for_parts, condition_band, baseline_key,
         PRICED_BANDS,
@@ -115,13 +115,42 @@ def run_pipeline() -> None:
     try:
         # ── Step 1: Search eBay ──────────────────────────────────────
         logger.info("Step 1: Searching eBay Italy...")
+        ebay_cfg = settings["ebay"]
+        trust_cfg = settings.get("seller_trust", {})
+        min_positive_pct = trust_cfg.get("min_positive_pct", 95.0)
+        min_sales = trust_cfg.get("min_sales", 10)
+
         listings = ebay.search_all_categories(
             categories=config["categories"],
-            max_pages=settings["ebay"].get("max_pages_per_category", 2),
-            results_per_page=settings["ebay"].get("results_per_page", 50),
+            max_pages=ebay_cfg.get("max_pages_per_category", 2),
+            results_per_page=ebay_cfg.get("results_per_page", 50),
+            foreign_marketplaces=ebay_cfg.get("foreign_marketplaces", []),
+            ship_to_country=ebay_cfg.get("ship_to_country", "IT"),
         )
         stats["total_scanned"] = len(listings)
         logger.info("Found %d listings across all categories", len(listings))
+
+        # ── Cross-border trust gate ──────────────────────────────────
+        # Foreign listings are only considered from established, well-rated
+        # sellers. Dropped here so they never reach the baselines, the AI
+        # budget, or the resale dataset.
+        kept: list[dict] = []
+        for listing in listings:
+            trusted = is_trusted_seller(listing, min_positive_pct, min_sales)
+            listing["seller_trusted"] = trusted
+            if listing.get("is_foreign") and not trusted:
+                stats["skipped"] += 1
+                continue
+            kept.append(listing)
+
+        dropped_foreign = len(listings) - len(kept)
+        if dropped_foreign:
+            logger.info(
+                "Dropped %d foreign listing(s) from sellers below the trust bar "
+                "(>=%.1f%% positive, >=%d sales)",
+                dropped_foreign, min_positive_pct, min_sales,
+            )
+        listings = kept
 
         if not listings:
             logger.warning("No listings found — exiting")
@@ -264,8 +293,11 @@ def run_pipeline() -> None:
         for candidate in candidates:
             listing = candidate["listing"]
             try:
-                # Get full item details for description
-                details = ebay.get_item_details(listing["item_id"])
+                # Get full item details for description (query the listing's own
+                # marketplace — a foreign item can 404 against the home site).
+                details = ebay.get_item_details(
+                    listing["item_id"], marketplace=listing.get("marketplace")
+                )
                 if details:
                     shipping = listing.get("shipping_cost", 0.0) or 0.0
                     listing.update(details)
@@ -402,6 +434,9 @@ def run_pipeline() -> None:
                     "new_price": candidate["new_price"],
                     "baseline_source": candidate["baseline_source"],
                     "condition_band": candidate["band"],
+                    "seller_trusted": listing.get("seller_trusted", False),
+                    "is_foreign": listing.get("is_foreign", False),
+                    "marketplace": listing.get("marketplace", ""),
                     "discount_pct": candidate["discount_pct"],
                     "is_suspicious": candidate["is_suspicious"],
                     "seller_trust_level": seller_trust_level,
