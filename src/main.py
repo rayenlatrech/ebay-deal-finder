@@ -173,6 +173,14 @@ def run_pipeline() -> None:
         global_min_discount = settings["scanning"].get("min_discount_for_ai", 15)
         max_ai_analyses = settings["ai"].get("max_text_analyses_per_run", 50)
 
+        # Buckets that must never be alerted on (e.g. Galaxy A-series bar the A57).
+        excluded_patterns = []
+        for pattern in settings["scanning"].get("excluded_product_patterns", []) or []:
+            try:
+                excluded_patterns.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as e:
+                logger.error("Ignoring invalid excluded_product_pattern %r: %s", pattern, e)
+
         # Manually-curated new/street prices — used as a baseline ceiling so an
         # inflated eBay asking-median can't invent a deal (see the A57 case).
         reference_prices = db.get_reference_prices()
@@ -201,6 +209,11 @@ def run_pipeline() -> None:
             )
             # Skip items we couldn't classify or that have low confidence
             if not product_key or confidence < PriceTracker.MIN_CONFIDENCE:
+                stats["skipped"] += 1
+                continue
+
+            # Explicitly excluded buckets never become deals.
+            if any(p.search(product_key) for p in excluded_patterns):
                 stats["skipped"] += 1
                 continue
 
@@ -434,6 +447,7 @@ def run_pipeline() -> None:
                     "new_price": candidate["new_price"],
                     "baseline_source": candidate["baseline_source"],
                     "condition_band": candidate["band"],
+                    "product_key": candidate["product_key"],
                     "seller_trusted": listing.get("seller_trusted", False),
                     "is_foreign": listing.get("is_foreign", False),
                     "marketplace": listing.get("marketplace", ""),

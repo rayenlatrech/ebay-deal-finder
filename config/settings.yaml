@@ -33,6 +33,14 @@ ai:
 scanning:
   min_discount_for_ai: 10
   min_discount_for_alert: 15
+  # Product buckets that must never be alerted on. Regexes matched against the
+  # classifier's product_key. They still feed baselines and the resale dataset —
+  # this only stops them being surfaced as deals.
+  excluded_product_patterns:
+    # Galaxy A-series: only the A57 is of interest, every other A-model is out.
+    # The lookahead must end on "_" or end-of-string — "\b" fails here because
+    # regex counts "_" as a word character, so "a57_256gb" would be excluded.
+    - '^galaxy_a(?!57(?:_|$))\d+'
 
 # New-price ceiling. A used unit can't be worth its full new price, so the
 # ceiling is scaled per condition band before being used as a baseline.

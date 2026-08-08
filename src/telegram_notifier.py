@@ -225,6 +225,41 @@ class TelegramNotifier:
 
     # ── Batched Good Deals Summary ───────────────────────────────────
 
+    @staticmethod
+    def collapse_duplicates(deals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse listings of the same product down to the single best one.
+
+        A market-wide price move can put a dozen near-identical listings of one
+        model into a single summary, which buries everything else. Deals are
+        grouped by product key and only the strongest survives (highest score,
+        cheapest as tie-break); the rest are recorded as a `duplicate_count` so
+        the row can say "+N similar" instead of repeating itself.
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        ungrouped: list[dict[str, Any]] = []
+        for deal in deals:
+            key = deal.get("scores", {}).get("product_key")
+            if key:
+                groups.setdefault(key, []).append(deal)
+            else:
+                ungrouped.append(deal)
+
+        def strength(d: dict[str, Any]) -> tuple:
+            s, li = d.get("scores", {}), d.get("listing", {})
+            price = li.get("total_price") or li.get("price") or 0
+            return (-int(s.get("deal_score", 0)), float(price))
+
+        collapsed: list[dict[str, Any]] = []
+        for members in groups.values():
+            members.sort(key=strength)
+            best = dict(members[0])
+            best["duplicate_count"] = len(members) - 1
+            collapsed.append(best)
+
+        collapsed.extend(ungrouped)
+        collapsed.sort(key=strength)
+        return collapsed
+
     def _deal_line(self, index: int, deal: dict[str, Any]) -> str:
         """Render one deal as a summary row."""
         listing = deal.get("listing", {})
@@ -243,6 +278,9 @@ class TelegramNotifier:
             line += " 🤝"
         if deal.get("analysis", {}).get("photo_type", "") == "stock":
             line += " 📷"
+        dupes = deal.get("duplicate_count", 0)
+        if dupes:
+            line += f"  <i>(+{dupes} similar)</i>"
         return line
 
     def send_deal_summary(self, deals: list[dict[str, Any]]) -> bool:
@@ -255,12 +293,17 @@ class TelegramNotifier:
         if not deals:
             return True
 
+        total = len(deals)
+        deals = self.collapse_duplicates(deals)
         trusted = [d for d in deals if d.get("scores", {}).get("seller_trusted")]
         others = [d for d in deals if not d.get("scores", {}).get("seller_trusted")]
 
+        headline = f"Found {total} good deal{'s' if total != 1 else ''}"
+        if len(deals) < total:
+            headline += f" across {len(deals)} product{'s' if len(deals) != 1 else ''}"
         lines = [
             "📊 <b>eBay Deal Summary</b>",
-            f"Found {len(deals)} good deal{'s' if len(deals) != 1 else ''}:",
+            headline + ":",
         ]
 
         counter = 1

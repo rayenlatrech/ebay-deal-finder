@@ -83,6 +83,39 @@ def test_is_trusted_seller_handles_missing_fields():
                               "seller_feedback_score": None}) is False
 
 
+def test_collapse_duplicates_keeps_only_the_best_per_product():
+    from src.telegram_notifier import TelegramNotifier
+
+    def deal(key, score, price):
+        return {
+            "listing": {"title": key, "total_price": price},
+            "scores": {"product_key": key, "deal_score": score},
+        }
+
+    deals = [
+        deal("macbook_pro_m1_pro_14", 71, 600),
+        deal("macbook_pro_m1_pro_14", 77, 625),   # best score -> survivor
+        deal("macbook_pro_m1_pro_14", 72, 534),
+        deal("iphone_15_128gb", 68, 400),
+    ]
+    out = TelegramNotifier.collapse_duplicates(deals)
+    assert len(out) == 2
+
+    mac = next(d for d in out if d["scores"]["product_key"] == "macbook_pro_m1_pro_14")
+    assert mac["scores"]["deal_score"] == 77
+    assert mac["duplicate_count"] == 2
+
+    iph = next(d for d in out if d["scores"]["product_key"] == "iphone_15_128gb")
+    assert iph["duplicate_count"] == 0
+
+
+def test_collapse_duplicates_passes_through_unkeyed_deals():
+    from src.telegram_notifier import TelegramNotifier
+
+    deals = [{"listing": {"title": "x", "total_price": 10}, "scores": {"deal_score": 60}}]
+    assert len(TelegramNotifier.collapse_duplicates(deals)) == 1
+
+
 def test_overpriced_scores_zero(scorer):
     score, discount, _ = scorer.calculate_price_score(120.0, 100.0)
     assert score == 0

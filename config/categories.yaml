@@ -67,13 +67,21 @@ categories:
       - {max_discount: 100, score: 100}
 
   # ── Everything else: default sensitivity, lower priority ────────────
+  # MacBooks were flooding the alerts, so the bar is deliberately higher: a
+  # bigger minimum discount, and a curve that only pays out at steep discounts.
   - name: "MacBooks"
     query: 'MacBook -cover -parts -broken'
     category_id: "111422"
     min_price: 300
     max_price: 1500
     priority: 1.5
-    min_discount: 15
+    min_discount: 25
+    price_scores:
+      - {max_discount: 25,  score: 0}
+      - {max_discount: 35,  score: 25}
+      - {max_discount: 45,  score: 50}
+      - {max_discount: 55,  score: 75}
+      - {max_discount: 100, score: 90}
 
   - name: "Xbox Series X"
     query: 'Xbox Series X -controller -game -gioco -parts -broken'
