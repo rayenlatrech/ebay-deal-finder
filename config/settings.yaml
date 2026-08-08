@@ -29,12 +29,17 @@ seller_trust:
   min_sales: 10
 
 ai:
-  primary_provider: "gemini"
-  fallback_provider: "groq"
-  gemini_model: "gemini-2.5-flash"
+  # Text cascade: Groq -> Cerebras -> Gemini. Gemini is last for text because
+  # it's the only provider that can do vision, so its quota is saved for images.
   groq_model: "llama-3.3-70b-versatile"
+  cerebras_model: "llama-3.3-70b"
+  gemini_model: "gemini-2.5-flash"
   max_image_analyses_per_run: 20
   max_text_analyses_per_run: 50
+  # Reuse a stored assessment for a listing seen within this many hours. A
+  # listing's description and photos don't change, and items sit on eBay for
+  # weeks, so without this the same item is re-analysed on every scan.
+  cache_hours: 72
 
 scanning:
   min_discount_for_ai: 10

@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +21,19 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("deal_finder")
+
+
+def _image_score_for(photo_type: str, condition_matches: Optional[bool]) -> int:
+    """Map a photo verdict to its image score (shared by fresh and cached paths)."""
+    if photo_type == "real":
+        if condition_matches is True:
+            return 85
+        if condition_matches is False:
+            return 30
+        return 60
+    if photo_type == "stock":
+        return 20
+    return 40
 
 
 def _hours_until(timestamp: str, now: datetime) -> Optional[float]:
@@ -364,8 +377,18 @@ def run_pipeline() -> None:
         max_image_analyses = settings["ai"].get("max_image_analyses_per_run", 20)
         image_analyses_done = 0
 
+        # A listing's description and photos never change, so reuse any recent
+        # assessment instead of paying for the same answer every scan.
+        cache_hours = settings["ai"].get("cache_hours", 72)
+        cache_since = (datetime.now(timezone.utc) - timedelta(hours=cache_hours)).isoformat()
+        analysis_cache = db.get_recent_analyses(
+            [c["listing"]["item_id"] for c in candidates], cache_since
+        )
+        cache_hits = 0
+
         for candidate in candidates:
             listing = candidate["listing"]
+            cached = analysis_cache.get(listing["item_id"])
             try:
                 # Get full item details for description (query the listing's own
                 # marketplace — a foreign item can 404 against the home site).
@@ -384,8 +407,12 @@ def run_pipeline() -> None:
                 listing["avg_price"] = candidate["avg_price"]
                 listing["discount_pct"] = candidate["discount_pct"]
 
-                # Run AI text analysis (Groq)
-                text_analysis = ai.analyze_listing(listing)
+                # Run AI text analysis (cached result if we've seen this listing)
+                if cached:
+                    text_analysis = cached
+                    cache_hits += 1
+                else:
+                    text_analysis = ai.analyze_listing(listing)
 
                 # Instantly drop accessories/boxes/incomplete items caught by Groq
                 if not text_analysis.get("is_complete_item", True):
@@ -442,8 +469,17 @@ def run_pipeline() -> None:
                                 f"image_reused_by_{seller_count}_sellers"
                             )
 
+                # A cached assessment already carries the photo verdict, so the
+                # image never needs downloading or re-analysing.
+                if cached and cached.get("photo_type"):
+                    image_analysis = cached
+                    photo_type = cached.get("photo_type", "uncertain")
+                    image_score = _image_score_for(
+                        photo_type, cached.get("condition_matches_description")
+                    )
+
                 # Full image analysis for top candidates
-                if image_analyses_done < max_image_analyses and image_url:
+                elif image_analyses_done < max_image_analyses and image_url:
                     image_analysis = ai.analyze_image(
                         image_url,
                         condition=listing.get("condition", ""),
@@ -452,18 +488,9 @@ def run_pipeline() -> None:
                     image_analyses_done += 1
 
                     photo_type = image_analysis.get("photo_type", "uncertain")
-                    if photo_type == "real":
-                        match = image_analysis.get("condition_matches_description")
-                        if match is True:
-                            image_score = 85
-                        elif match is False:
-                            image_score = 30
-                        else:
-                            image_score = 60
-                    elif photo_type == "stock":
-                        image_score = 20
-                    else:
-                        image_score = 40
+                    image_score = _image_score_for(
+                        photo_type, image_analysis.get("condition_matches_description")
+                    )
 
                 elif quick_check.get("suspicious"):
                     photo_type = "stock"
@@ -583,6 +610,12 @@ def run_pipeline() -> None:
                     db.mark_alerted(deal["listing"]["item_id"])
             else:
                 logger.warning("Deal summary failed to send — not marking as alerted")
+
+        if candidates:
+            logger.info(
+                "AI cache: %d/%d candidates reused a stored assessment (%d fresh calls)",
+                cache_hits, len(candidates), len(candidates) - cache_hits,
+            )
 
         # ── Record which sellers produced deals ──────────────────────
         try:

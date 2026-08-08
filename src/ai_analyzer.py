@@ -88,6 +88,10 @@ Return ONLY valid JSON (no markdown, no explanation):
         self.db = db_instance
         self.gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
         self.groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        # Cerebras serves the same 70B class model with a far larger free daily
+        # token budget, so it backs Groq up rather than replacing the model.
+        self.cerebras_key = os.environ.get("CEREBRAS_API_KEY")
+        self.cerebras_model = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
 
         # Load all Gemini keys (GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc.)
         self.gemini_keys = []
@@ -113,9 +117,10 @@ Return ONLY valid JSON (no markdown, no explanation):
             logger.warning("Groq package not installed, text-only fallback unavailable")
 
         logger.info(
-            "AI Analyzer initialized: %d Gemini key(s) available, Groq %s",
+            "AI Analyzer initialized: %d Gemini key(s), Groq %s, Cerebras %s",
             len(self.gemini_keys),
             "available" if self.groq_client else "unavailable",
+            "available" if self.cerebras_key else "unavailable",
         )
 
     # ── Gemini Calls with Key Rotation ───────────────────────────────
@@ -222,16 +227,59 @@ Return ONLY valid JSON (no markdown, no explanation):
             logger.error("Groq API error: %s", e)
             return None
 
+    # ── Cerebras Fallback ────────────────────────────────────────────
+
+    def _call_cerebras(self, prompt: str) -> Optional[str]:
+        """Call Cerebras (OpenAI-compatible) for text-only analysis.
+
+        Same 70B-class model as Groq but with a much larger free daily token
+        budget, so it takes over when Groq's quota runs out.
+        """
+        if not self.cerebras_key:
+            return None
+        try:
+            resp = requests.post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.cerebras_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.cerebras_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "max_tokens": 1024,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=45,
+            )
+            if resp.status_code != 200:
+                logger.error("Cerebras API error %d: %s", resp.status_code, resp.text[:200])
+                return None
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error("Cerebras API error: %s", e)
+            return None
+
     def _call_ai(self, prompt: str, image_data: Optional[bytes] = None) -> Optional[str]:
-        """Call AI with cascading pipeline: Groq for Text → Gemini for Images."""
-        # If no image, Groq is the primary engine
+        """Cascade text through the cheapest available provider; images to Gemini.
+
+        Text order is Groq → Cerebras → Gemini. Gemini is deliberately last for
+        text because it is the only provider that can do vision, so its quota is
+        reserved for image analysis wherever possible.
+        """
         if not image_data:
             result = self._call_groq(prompt)
             if result:
                 return result
-            logger.info("Groq failed or unavailable, falling back to Gemini for text")
+            logger.info("Groq unavailable, trying Cerebras for text")
 
-        # If it's an image, or Groq failed, use Gemini
+            result = self._call_cerebras(prompt)
+            if result:
+                return result
+            logger.info("Cerebras unavailable, falling back to Gemini for text")
+
+        # Images always go to Gemini; text lands here only if both others failed.
         result = self._call_gemini(prompt, image_data)
         if result:
             return result

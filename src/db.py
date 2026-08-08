@@ -98,6 +98,37 @@ class Database:
             logger.error("Failed to check alert status for %s: %s", item_id, e)
             return False
 
+    def get_recent_analyses(self, item_ids: list[str], since_iso: str) -> dict[str, dict]:
+        """Recent AI assessments for these listings, keyed by listing id.
+
+        A listing's description and photos don't change, so re-running the AI on
+        the same item every scan burns quota for an answer we already have.
+        Listings can sit on eBay for weeks, so this is the difference between
+        analysing an item once and analysing it dozens of times.
+        """
+        out: dict[str, dict] = {}
+        unique = list({i for i in item_ids if i})
+        CHUNK = 200
+        for start in range(0, len(unique), CHUNK):
+            chunk = unique[start:start + CHUNK]
+            try:
+                resp = (
+                    self.client.table("analyses")
+                    .select("listing_id, ai_assessment, analyzed_at")
+                    .in_("listing_id", chunk)
+                    .gte("analyzed_at", since_iso)
+                    .order("analyzed_at", desc=True)
+                    .execute()
+                )
+                for row in (resp.data or []):
+                    # Ordered newest-first, so keep the first hit per listing.
+                    lid = row["listing_id"]
+                    if lid not in out and row.get("ai_assessment"):
+                        out[lid] = row["ai_assessment"]
+            except Exception as e:
+                logger.error("Failed to load cached analyses: %s", e)
+        return out
+
     def get_alerted_ids(self, item_ids: list[str]) -> set[str]:
         """Which of these listings have already been alerted on.
 
