@@ -115,6 +115,7 @@ class EbayClient:
         marketplace: Optional[str] = None,
         item_location_country: Optional[str] = None,
         delivery_country: Optional[str] = None,
+        include_auctions: bool = False,
     ) -> dict[str, Any]:
         """Search eBay listings with filters.
 
@@ -130,7 +131,8 @@ class EbayClient:
         marketplace = marketplace or self.marketplace
 
         # Build filter string
-        filters = ["buyingOptions:{FIXED_PRICE}"]
+        buying = "{FIXED_PRICE|AUCTION}" if include_auctions else "{FIXED_PRICE}"
+        filters = [f"buyingOptions:{buying}"]
         if item_location_country:
             filters.append(f"itemLocationCountry:{item_location_country}")
         if delivery_country:
@@ -185,10 +187,21 @@ class EbayClient:
 
             base_price = float(price_info.get("value", 0))
 
+            # For an auction the live price is the current bid, not `price`
+            # (which eBay may report as the starting or Buy-It-Now amount).
+            is_auction = "AUCTION" in buying_options
+            bid_info = raw.get("currentBidPrice") or {}
+            if is_auction and bid_info.get("value") is not None:
+                base_price = float(bid_info["value"])
+                price_info = bid_info
+
             return {
                 "item_id": raw.get("itemId", ""),
                 "title": raw.get("title", ""),
                 "price": base_price,
+                "is_auction": is_auction,
+                "bid_count": int(raw.get("bidCount") or 0),
+                "auction_end": raw.get("itemEndDate", ""),
                 "shipping_cost": shipping_cost,
                 "total_price": base_price + shipping_cost,
                 "currency": price_info.get("currency", "EUR"),
@@ -306,6 +319,7 @@ class EbayClient:
         results_per_page: int = 50,
         foreign_marketplaces: Optional[list[str]] = None,
         ship_to_country: Optional[str] = None,
+        include_auctions: bool = False,
     ) -> list[dict]:
         """Search every configured category across every configured marketplace.
 
@@ -349,6 +363,7 @@ class EbayClient:
                             marketplace=marketplace,
                             item_location_country=loc_country,
                             delivery_country=delivery_country,
+                            include_auctions=include_auctions,
                         )
                     except Exception as e:
                         logger.error(

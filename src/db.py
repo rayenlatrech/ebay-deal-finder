@@ -277,6 +277,31 @@ class Database:
         except Exception as e:
             logger.error("Failed to upsert %d tracked listings: %s", len(records), e)
 
+    def get_tracked_prices(self, item_ids: list[str]) -> dict[str, dict]:
+        """Previously-recorded price info for these listings, keyed by id.
+
+        Used to spot price cuts: a seller dropping their asking price is a
+        motivated seller, which is a stronger signal than a listing that merely
+        looked cheap the first time we saw it.
+        """
+        out: dict[str, dict] = {}
+        unique = list({i for i in item_ids if i})
+        CHUNK = 200
+        for start in range(0, len(unique), CHUNK):
+            chunk = unique[start:start + CHUNK]
+            try:
+                resp = (
+                    self.client.table("tracked_listings")
+                    .select("id, price, first_price")
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in (resp.data or []):
+                    out[row["id"]] = row
+            except Exception as e:
+                logger.error("Failed to load tracked prices: %s", e)
+        return out
+
     def get_stale_tracked(self, stale_before_iso: str, limit: int) -> list[dict]:
         """Active tracked rows not seen since `stale_before_iso`, oldest-checked first."""
         try:
@@ -369,6 +394,68 @@ class Database:
             self.client.table(table).delete().lt(column, cutoff_iso).execute()
         except Exception as e:
             logger.error("Retention delete failed on %s.%s: %s", table, column, e)
+
+    # ── Seller quality tracking ───────────────────────────────────────
+
+    def record_deal_sellers(self, sellers: list[dict[str, Any]]) -> None:
+        """Increment each seller's deal tally.
+
+        Sellers who repeatedly list below market (estate clearers, people
+        offloading gear they don't specialise in) are a durable edge: worth
+        watching directly rather than waiting for the scanner to find them.
+        Read-modify-write is fine here — only a handful of sellers per run.
+        """
+        if not sellers:
+            return
+        names = [s["seller_username"] for s in sellers if s.get("seller_username")]
+        if not names:
+            return
+        try:
+            resp = (
+                self.client.table("seller_stats")
+                .select("seller_username, deals_found")
+                .in_("seller_username", names)
+                .execute()
+            )
+            existing = {r["seller_username"]: r.get("deals_found") or 0 for r in (resp.data or [])}
+        except Exception as e:
+            logger.error("Failed to read seller stats: %s", e)
+            existing = {}
+
+        now = datetime.now(timezone.utc).isoformat()
+        records = []
+        for s in sellers:
+            name = s.get("seller_username")
+            if not name:
+                continue
+            records.append({
+                "seller_username": name,
+                "marketplace": s.get("marketplace"),
+                "deals_found": existing.get(name, 0) + s.get("count", 1),
+                "last_deal_at": now,
+            })
+        try:
+            self.client.table("seller_stats").upsert(
+                records, on_conflict="seller_username"
+            ).execute()
+        except Exception as e:
+            logger.error("Failed to record seller stats: %s", e)
+
+    def get_top_deal_sellers(self, limit: int = 10, min_deals: int = 2) -> list[dict]:
+        """Sellers who have produced the most deals, best first."""
+        try:
+            resp = (
+                self.client.table("seller_stats")
+                .select("*")
+                .gte("deals_found", min_deals)
+                .order("deals_found", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return resp.data or []
+        except Exception as e:
+            logger.error("Failed to load top sellers: %s", e)
+            return []
 
     # ── Reference prices (manually-curated new/street prices) ─────────
 

@@ -61,6 +61,10 @@ class SoldTracker:
             return 0
 
         now_iso = _now().isoformat()
+        # Previously-seen prices, so a seller's price cut can be detected and
+        # the original asking price preserved across upserts.
+        previous = self.db.get_tracked_prices([l.get("item_id") for l in listings])
+
         records = []
         for it in listings:
             band = condition_band(it)
@@ -77,6 +81,15 @@ class SoldTracker:
             price = float(it.get("total_price") or it.get("price") or 0)
             if price <= 0:
                 continue
+            # Carry the original asking price forward so the upsert can't erase
+            # it, and expose any drop since then on the listing itself.
+            prior = previous.get(it["item_id"]) or {}
+            first_price = prior.get("first_price") or prior.get("price") or price
+            first_price = float(first_price)
+            if first_price > 0 and price < first_price:
+                it["price_drop_pct"] = round((first_price - price) / first_price * 100, 1)
+                it["original_price"] = round(first_price, 2)
+
             # NOTE: first_seen is intentionally omitted so the column DEFAULT
             # fires on insert and is preserved (not overwritten) on update.
             records.append({
@@ -85,6 +98,7 @@ class SoldTracker:
                 "condition_band": band,
                 "marketplace": it.get("marketplace") or None,
                 "price": round(price, 2),
+                "first_price": round(first_price, 2),
                 "status": "active",
                 "last_seen": now_iso,
                 "last_checked": now_iso,

@@ -146,7 +146,8 @@ class TelegramNotifier:
         trust_level = scores.get("seller_trust_level", "unknown")
 
         flag = self._flag(scores.get("marketplace", ""))
-        header = "🔥 <b>HOT DEAL FOUND!</b>"
+        header = "⏳ <b>AUCTION ENDING SOON!</b>" if scores.get("is_auction") \
+            else "🔥 <b>HOT DEAL FOUND!</b>"
         if scores.get("seller_trusted"):
             header += "  ⭐ <b>TRUSTED SELLER</b>"
         if scores.get("is_foreign"):
@@ -158,8 +159,20 @@ class TelegramNotifier:
             f"📱 {flag} {self._esc(listing.get('title', 'Unknown'))}".strip(),
             f"💰 Price: €{price:.0f} (€{avg_price:.0f} {self._esc(baseline_source)}, <b>{discount_pct:.0f}% OFF</b>)",
         ]
+        if scores.get("is_auction"):
+            hours = scores.get("hours_left")
+            bids = scores.get("bid_count", 0)
+            when = f"{hours:.1f}h left" if hours is not None else "ending soon"
+            bid_text = f"{bids} bid{'s' if bids != 1 else ''}" if bids else "<b>no bids yet</b>"
+            lines.append(f"   🔨 Auction — {when}, {bid_text} (price is the current bid)")
         if shipping:
             lines.append(f"   📦 incl. €{shipping:.0f} shipping")
+        drop = scores.get("price_drop_pct")
+        original = scores.get("original_price")
+        if drop and original:
+            lines.append(
+                f"   📉 <b>Seller cut the price {drop:.0f}%</b> (was €{original:.0f}) — motivated seller"
+            )
         band = scores.get("condition_band")
         if band:
             lines.append(f"   🏷️ Compared against <b>{self._esc(band)}</b> listings")
@@ -278,6 +291,11 @@ class TelegramNotifier:
             line += " 🤝"
         if deal.get("analysis", {}).get("photo_type", "") == "stock":
             line += " 📷"
+        if scores.get("is_auction"):
+            hours = scores.get("hours_left")
+            line += f" 🔨{hours:.0f}h" if hours is not None else " 🔨"
+        if scores.get("price_drop_pct"):
+            line += " 📉"
         dupes = deal.get("duplicate_count", 0)
         if dupes:
             line += f"  <i>(+{dupes} similar)</i>"
@@ -321,7 +339,7 @@ class TelegramNotifier:
 
         lines.extend([
             "",
-            "🤝 = Make Offer | 📷 = Stock photo | 🌍 flags show the eBay site",
+            "🤝 = Make Offer | 📷 = Stock photo | 📉 = seller cut the price",
         ])
         return self._send_message("\n".join(lines))
 
@@ -342,6 +360,18 @@ class TelegramNotifier:
         errors = stats.get("errors", 0)
         if errors > 0:
             lines.append(f"❌ Errors: {errors}")
+
+        # Standing cross-border price gaps — worth knowing even on a quiet scan.
+        gaps = stats.get("arbitrage") or []
+        if gaps:
+            lines.extend(["", "💱 <b>Cross-border price gaps</b>"])
+            for g in gaps:
+                flag = self._flag(g["cheapest_market"])
+                lines.append(
+                    f"  {self._esc(g['product_key'])} ({self._esc(g['condition_band'])}): "
+                    f"{flag} €{g['cheapest_price']:.0f} vs €{g['home_price']:.0f} home "
+                    f"— <b>{g['gap_pct']:.0f}% cheaper</b>"
+                )
 
         lines.append("\n⏰ Next scan in ~4 hours")
         return self._send_message("\n".join(lines))

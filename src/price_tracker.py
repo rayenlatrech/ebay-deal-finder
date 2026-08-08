@@ -142,9 +142,10 @@ class PriceTracker:
     # "what you'd actually pay" much better. See the A57 reference-price note.
     BASELINE_PERCENTILE = 35
 
-    def __init__(self, db: Database) -> None:
-        """Initialize with database client."""
+    def __init__(self, db: Database, marketplace_home: str = "EBAY_IT") -> None:
+        """Initialize with database client and the home marketplace id."""
         self.db = db
+        self.marketplace_home = marketplace_home
 
     # ── Baseline retrieval ────────────────────────────────────────────
 
@@ -237,6 +238,10 @@ class PriceTracker:
         groups: dict[str, list[tuple[float, str]]] = {}
 
         for listing in listings:
+            # An in-flight auction's current bid is not a market price — it only
+            # becomes one at close — so auctions never shape the baseline.
+            if listing.get("is_auction"):
+                continue
             band = condition_band(listing)
             if band not in PRICED_BANDS:
                 continue
@@ -287,6 +292,66 @@ class PriceTracker:
 
         logger.info("Computed robust baselines for %d products", len(baselines))
         return baselines
+
+    def find_marketplace_gaps(
+        self, listings: list[dict], min_samples: int = 3, min_gap_pct: float = 10.0
+    ) -> list[dict]:
+        """Find products that are systematically cheaper on another eBay site.
+
+        A single cheap listing is a deal; a whole marketplace pricing a product
+        lower is a standing arbitrage route, which is far more durable. Only
+        buckets with real sample counts on both sides are compared, and prices
+        are totals so cross-border shipping is already accounted for.
+        """
+        home = self.marketplace_home
+        # (product_key, band, marketplace) -> prices
+        groups: dict[tuple[str, str, str], list[float]] = {}
+        for it in listings:
+            if it.get("is_auction"):
+                continue
+            band = condition_band(it)
+            if band not in PRICED_BANDS:
+                continue
+            key, conf = self.generate_product_key(
+                it.get("title", ""), it.get("category", ""),
+                it.get("epid", ""), it.get("condition_id", ""),
+            )
+            price = float(it.get("total_price") or it.get("price") or 0)
+            if not key or conf < self.MIN_CONFIDENCE or price <= 0:
+                continue
+            groups.setdefault((key, band, it.get("marketplace") or home), []).append(price)
+
+        # Collapse to a robust price per (product, band, marketplace).
+        priced: dict[tuple[str, str], dict[str, float]] = {}
+        for (key, band, market), prices in groups.items():
+            if len(prices) < min_samples:
+                continue
+            value = self._percentile(self._reject_outliers(prices), self.BASELINE_PERCENTILE)
+            if value:
+                priced.setdefault((key, band), {})[market] = round(value, 2)
+
+        gaps = []
+        for (key, band), by_market in priced.items():
+            if home not in by_market or len(by_market) < 2:
+                continue
+            home_price = by_market[home]
+            cheapest_market = min(by_market, key=by_market.get)
+            cheapest = by_market[cheapest_market]
+            if cheapest_market == home or cheapest <= 0:
+                continue
+            gap_pct = (home_price - cheapest) / home_price * 100
+            if gap_pct >= min_gap_pct:
+                gaps.append({
+                    "product_key": key,
+                    "condition_band": band,
+                    "home_price": home_price,
+                    "cheapest_market": cheapest_market,
+                    "cheapest_price": cheapest,
+                    "gap_pct": round(gap_pct, 1),
+                })
+
+        gaps.sort(key=lambda g: g["gap_pct"], reverse=True)
+        return gaps
 
     # ── Classification ────────────────────────────────────────────────
 
@@ -361,6 +426,10 @@ class PriceTracker:
         is_part, recognized_variant = self._is_accessory_listing(
             t, fam_start, variant_suffix
         )
+        # A title advertising several models can't be priced as one product.
+        if self._is_multi_model(family, t):
+            return final_key + "_multi", 0.3
+
         if recognized_variant:
             confidence = 0.97
         elif is_part:
@@ -374,6 +443,26 @@ class PriceTracker:
         return final_key, confidence
 
     # ── Family detection & key building ──────────────────────────────
+
+    # Model tokens per family, used to spot titles advertising several models
+    # at once ("Galaxy A27 256GB 8GB 5G A26 128GB"). The quoted price belongs to
+    # the cheapest variant, so the listing must not be trusted as one product.
+    MULTI_MODEL_PATTERNS = {
+        "galaxy": re.compile(r"\b(s\d{1,2}|a\d{1,2}|note\s*\d{1,2})\b", re.IGNORECASE),
+        "iphone": re.compile(r"\biphone\s*(\d{1,2})", re.IGNORECASE),
+    }
+
+    @classmethod
+    def _is_multi_model(cls, family: str, t: str) -> bool:
+        """True if the title names two or more distinct models of one family."""
+        pattern = cls.MULTI_MODEL_PATTERNS.get(family)
+        if not pattern:
+            return False
+        found = {
+            re.sub(r"\s+", "", m).lower()
+            for m in pattern.findall(t)
+        }
+        return len(found) > 1
 
     @staticmethod
     def _detect_family(t: str) -> Tuple[Optional[str], int]:

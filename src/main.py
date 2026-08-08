@@ -4,7 +4,9 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -19,6 +21,17 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("deal_finder")
+
+
+def _hours_until(timestamp: str, now: datetime) -> Optional[float]:
+    """Hours from `now` until an eBay ISO timestamp, or None if unparseable."""
+    if not timestamp:
+        return None
+    try:
+        end = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (end - now).total_seconds() / 3600.0
 
 
 def load_config(db=None) -> dict:
@@ -99,7 +112,7 @@ def run_pipeline() -> None:
     ebay = EbayClient()
     ai = AIAnalyzer(db)
     scorer = DealScorer()
-    price_tracker = PriceTracker(db)
+    price_tracker = PriceTracker(db, settings["ebay"].get("marketplace", "EBAY_IT"))
     sold_tracker = SoldTracker(db, price_tracker, settings.get("tracking", {}))
     telegram = TelegramNotifier()
 
@@ -126,9 +139,31 @@ def run_pipeline() -> None:
             results_per_page=ebay_cfg.get("results_per_page", 50),
             foreign_marketplaces=ebay_cfg.get("foreign_marketplaces", []),
             ship_to_country=ebay_cfg.get("ship_to_country", "IT"),
+            include_auctions=ebay_cfg.get("include_auctions", False),
         )
         stats["total_scanned"] = len(listings)
         logger.info("Found %d listings across all categories", len(listings))
+
+        # ── Bad-unit title filter ────────────────────────────────────
+        # Carrier-locked, iCloud-locked and non-EU stock are bad buys at any
+        # price, so they're dropped before anything else looks at them.
+        title_blocklist = []
+        for pattern in settings["scanning"].get("excluded_title_patterns", []) or []:
+            try:
+                title_blocklist.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as e:
+                logger.error("Ignoring invalid excluded_title_pattern %r: %s", pattern, e)
+
+        if title_blocklist:
+            before = len(listings)
+            listings = [
+                l for l in listings
+                if not any(p.search(l.get("title", "")) for p in title_blocklist)
+            ]
+            blocked = before - len(listings)
+            if blocked:
+                stats["skipped"] += blocked
+                logger.info("Dropped %d listing(s) matching bad-unit title patterns", blocked)
 
         # ── Cross-border trust gate ──────────────────────────────────
         # Foreign listings are only considered from established, well-rated
@@ -168,6 +203,20 @@ def run_pipeline() -> None:
         logger.info("Step 2: Updating market price history...")
         market_prices = price_tracker.update_market_prices(listings)
 
+        # Standing cross-border price gaps (a whole market pricing lower is a
+        # more durable edge than any single cheap listing).
+        try:
+            arbitrage = price_tracker.find_marketplace_gaps(listings)
+            stats["arbitrage"] = arbitrage[:5]
+            for gap in arbitrage[:5]:
+                logger.info(
+                    "💱 %s (%s): €%.0f on %s vs €%.0f home (%.0f%% cheaper)",
+                    gap["product_key"], gap["condition_band"], gap["cheapest_price"],
+                    gap["cheapest_market"], gap["home_price"], gap["gap_pct"],
+                )
+        except Exception as e:
+            logger.error("Arbitrage scan failed: %s", e)
+
         # ── Step 3: Score on Price & Filter ──────────────────────────
         logger.info("Step 3: Scoring listings on price...")
         global_min_discount = settings["scanning"].get("min_discount_for_ai", 15)
@@ -193,8 +242,20 @@ def run_pipeline() -> None:
         # Listings already alerted on, fetched once instead of per-listing.
         alerted_ids = db.get_alerted_ids([l["item_id"] for l in listings])
 
+        auction_window_h = ebay_cfg.get("auction_ending_within_hours", 6)
+        now_utc = datetime.now(timezone.utc)
+
         candidates = []
         for listing in listings:
+            # An auction is only judgeable near its close — before that the bid
+            # will keep moving, so a "cheap" auction means nothing yet.
+            if listing.get("is_auction"):
+                hours_left = _hours_until(listing.get("auction_end"), now_utc)
+                if hours_left is None or not (0 < hours_left <= auction_window_h):
+                    stats["skipped"] += 1
+                    continue
+                listing["hours_left"] = hours_left
+
             # Drop for-parts and refurbished units before they reach the funnel.
             band = condition_band(listing)
             if is_for_parts(listing) or band not in PRICED_BANDS:
@@ -448,6 +509,11 @@ def run_pipeline() -> None:
                     "baseline_source": candidate["baseline_source"],
                     "condition_band": candidate["band"],
                     "product_key": candidate["product_key"],
+                    "price_drop_pct": listing.get("price_drop_pct"),
+                    "original_price": listing.get("original_price"),
+                    "is_auction": listing.get("is_auction", False),
+                    "bid_count": listing.get("bid_count", 0),
+                    "hours_left": listing.get("hours_left"),
                     "seller_trusted": listing.get("seller_trusted", False),
                     "is_foreign": listing.get("is_foreign", False),
                     "marketplace": listing.get("marketplace", ""),
@@ -517,6 +583,24 @@ def run_pipeline() -> None:
                     db.mark_alerted(deal["listing"]["item_id"])
             else:
                 logger.warning("Deal summary failed to send — not marking as alerted")
+
+        # ── Record which sellers produced deals ──────────────────────
+        try:
+            tally: dict[str, dict] = {}
+            for deal in hot_deals + good_deals:
+                name = deal["listing"].get("seller_username")
+                if not name:
+                    continue
+                entry = tally.setdefault(name, {
+                    "seller_username": name,
+                    "marketplace": deal["listing"].get("marketplace"),
+                    "count": 0,
+                })
+                entry["count"] += 1
+            if tally:
+                db.record_deal_sellers(list(tally.values()))
+        except Exception as e:
+            logger.error("Seller stat recording failed: %s", e)
 
         # ── Step 9: Resale tracking maintenance (never breaks a scan) ─
         try:

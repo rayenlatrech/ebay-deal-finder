@@ -131,6 +131,21 @@ def test_macbook_chip_not_dropped_when_size_precedes_it(tracker):
     assert air_m1 != air_m4
 
 
+@pytest.mark.parametrize("title,is_multi", [
+    ("Samsung Galaxy A27 256GB 8GB 5G A26 128GB", True),   # two A-models
+    ("Samsung Galaxy S24 / S23 Ultra", True),
+    ("iPhone 13 iPhone 14 iPhone 15 lotto", True),
+    ("Samsung Galaxy S25 Ultra 256GB", False),
+    ("iPhone 15 Pro Max 256GB", False),
+])
+def test_multi_model_listings_lose_confidence(tracker, title, is_multi):
+    # The quoted price belongs to the cheapest model, so such a listing must
+    # never be trusted as a single product.
+    key, confidence = tracker.generate_product_key(title)
+    assert (confidence < PriceTracker.MIN_CONFIDENCE) is is_multi
+    assert key.endswith("_multi") is is_multi
+
+
 def test_unparseable_falls_back_to_epid(tracker):
     assert tracker.generate_product_key("Strange unparseable thing") == ("", 0.0)
     assert tracker.generate_product_key("Strange unparseable thing", epid="123456") == ("epid_123456", 0.9)
@@ -219,6 +234,56 @@ def test_epid_guard_keeps_unidentified_listings():
     ]
     prices = PriceTracker._purge_minority_epids(pairs)
     assert 402 in prices
+
+
+class _StubDB:
+    """Minimal DB stand-in: no history, swallows writes."""
+    def save_price_point(self, *args):
+        pass
+
+    def get_price_history(self, key):
+        return []
+
+
+def test_live_auction_bid_never_enters_the_baseline():
+    # A current bid is not a market price until the auction closes.
+    tracker = PriceTracker(_StubDB(), "EBAY_IT")
+    listings = [
+        {"title": "iPhone 15 128GB", "condition_id": "3000", "total_price": p}
+        for p in (500, 510, 495)
+    ]
+    listings.append({
+        "title": "iPhone 15 128GB", "condition_id": "3000",
+        "total_price": 50, "is_auction": True,
+    })
+    baselines = tracker.update_market_prices(listings)
+    assert all(value > 400 for value in baselines.values())
+
+
+def test_marketplace_gap_reports_cheaper_foreign_market():
+    tracker = PriceTracker(_StubDB(), "EBAY_IT")
+    listings = []
+    for price in (520, 530, 510, 540):
+        listings.append({"title": "iPhone 15 128GB", "condition_id": "3000",
+                         "total_price": price, "marketplace": "EBAY_IT"})
+    for price in (430, 440, 425, 445):
+        listings.append({"title": "iPhone 15 128GB", "condition_id": "3000",
+                         "total_price": price, "marketplace": "EBAY_DE"})
+
+    gaps = tracker.find_marketplace_gaps(listings)
+    assert len(gaps) == 1
+    assert gaps[0]["cheapest_market"] == "EBAY_DE"
+    assert gaps[0]["gap_pct"] > 10
+
+
+def test_marketplace_gap_ignores_single_market_products():
+    tracker = PriceTracker(_StubDB(), "EBAY_IT")
+    listings = [
+        {"title": "iPhone 15 128GB", "condition_id": "3000",
+         "total_price": p, "marketplace": "EBAY_IT"}
+        for p in (500, 510, 495, 505)
+    ]
+    assert tracker.find_marketplace_gaps(listings) == []
 
 
 def test_epid_guard_inactive_without_clear_majority():

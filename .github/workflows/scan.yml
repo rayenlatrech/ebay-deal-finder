@@ -31,7 +31,9 @@ jobs:
     # Only actually scan on the schedule or a manual run — not on every push.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Five marketplace sweeps plus reconciliation ran 12m07s; 15 left almost no
+    # slack, and a killed run loses the scan report.
+    timeout-minutes: 25
 
     steps:
       - name: Checkout code
