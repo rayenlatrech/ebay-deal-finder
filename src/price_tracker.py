@@ -65,8 +65,15 @@ BUNDLE_CONTEXT = re.compile(r"(\bwith\b|\bcon\b|inclus|compres|completo\s+di|\+)
 # device ("ricambio per iPhone 13", "replacement screen for ...").
 FOR_CONTEXT = re.compile(r"(ricambio|ricambi|replacement|compatibile|compatible|\bper\b|\bfor\b)", re.IGNORECASE)
 
-# Storage size extraction
+# Storage size extraction. Titles routinely list RAM *before* storage
+# ("MacBook Pro M1 Pro 16GB 512GB"), so every match is collected and the
+# largest wins — RAM is always smaller than the SSD it ships with.
 STORAGE_PATTERN = re.compile(r"(\d+)\s*(gb|tb)", re.IGNORECASE)
+
+# Smallest believable SSD on a Mac/iPad. A smaller figure in one of those
+# titles is RAM, not storage, so it must not become the bucket's storage tier.
+MIN_COMPUTER_STORAGE_GB = 64
+COMPUTER_FAMILIES = ("macbook", "ipad")
 
 # eBay conditionId for "For parts or not working"
 FOR_PARTS_CONDITION_ID = "7000"
@@ -377,9 +384,32 @@ class PriceTracker:
         return None, len(t)
 
     @staticmethod
-    def _storage_suffix(t: str) -> str:
-        m = STORAGE_PATTERN.search(t)
-        return f"_{m.group(1)}{m.group(2).lower()}" if m else ""
+    def _storage_suffix(t: str, family: Optional[str] = None) -> str:
+        """Largest GB/TB figure in the title, normalised into a key suffix.
+
+        Picking the largest (rather than the first) is what stops "16GB 512GB"
+        being read as a 16 GB machine, which used to split one laptop across
+        two buckets and halve each one's baseline sample count.
+        """
+        best: Optional[tuple[int, str, str]] = None  # (size_in_gb, number, unit)
+        for size, unit in STORAGE_PATTERN.findall(t):
+            try:
+                value = int(size)
+            except ValueError:
+                continue
+            unit = unit.lower()
+            in_gb = value * 1024 if unit == "tb" else value
+            if best is None or in_gb > best[0]:
+                best = (in_gb, size, unit)
+
+        if best is None:
+            return ""
+        in_gb, size, unit = best
+        # On a computer, a figure this small is RAM — better no storage tier
+        # than a wrong one.
+        if family in COMPUTER_FAMILIES and in_gb < MIN_COMPUTER_STORAGE_GB:
+            return ""
+        return f"_{size}{unit}"
 
     @staticmethod
     def _chip_suffix(t: str) -> str:
@@ -454,7 +484,7 @@ class PriceTracker:
         base = "macbook" + (f"_{line}" if line else "")
         size = MAC_SIZE_PATTERN.search(t)
         size_suffix = f"_{size.group(1)}" if size else ""
-        return base + self._chip_suffix(t) + size_suffix + self._storage_suffix(t)
+        return base + self._chip_suffix(t) + size_suffix + self._storage_suffix(t, "macbook")
 
     def _ipad_key(self, t: str) -> str:
         m = re.search(r"ipad\s*(pro|air|mini)?", t)
@@ -471,7 +501,7 @@ class PriceTracker:
             if gm:
                 extra += f"_gen{gm.group(1)}"
         base = "ipad" + (f"_{line}" if line else "")
-        return base + extra + self._storage_suffix(t)
+        return base + extra + self._storage_suffix(t, "ipad")
 
     def _ps5_key(self, t: str) -> Tuple[str, str]:
         if re.search(r"portal", t):

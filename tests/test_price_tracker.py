@@ -94,6 +94,33 @@ def test_variant_disambiguation(tracker, title, expected_key):
     assert confidence >= PriceTracker.MIN_CONFIDENCE
 
 
+@pytest.mark.parametrize("title,expected_key", [
+    # RAM is listed before storage — the SSD must win, not the RAM.
+    ('Apple MacBook Pro A2442 14,2" M1 PRO 16GB 512GB', "macbook_pro_m1_pro_14_512gb"),
+    ("MacBook Air M2 8GB 256GB", "macbook_air_m2_256gb"),
+    ("iPad Pro 11 M4 8GB 256GB", "ipad_pro_m4_11_256gb"),
+    # TB beats GB even though its number is smaller.
+    ("MacBook Pro 14 M1 Pro 16GB 1TB", "macbook_pro_m1_pro_14_1tb"),
+    # Phones list RAM too.
+    ("iPhone 14 6GB RAM 128GB", "iphone_14_128gb"),
+    ("Samsung Galaxy S25 12GB 256GB", "galaxy_s25_256gb"),
+])
+def test_storage_prefers_largest_not_first(tracker, title, expected_key):
+    assert tracker.generate_product_key(title)[0] == expected_key
+
+
+def test_ram_only_computer_title_gets_no_storage_tier(tracker):
+    # No SSD in the title: better to omit the tier than record 16GB of RAM as
+    # storage, which would strand the listing in a bucket of its own.
+    assert tracker.generate_product_key("MacBook Pro M1 Pro 16GB")[0] == "macbook_pro_m1_pro"
+
+
+def test_ram_differences_do_not_fragment_a_bucket(tracker):
+    a, _ = tracker.generate_product_key("MacBook Pro 14 M1 Pro 16GB 1TB")
+    b, _ = tracker.generate_product_key("MacBook Pro 14 M1 Pro 32GB 1TB")
+    assert a == b == "macbook_pro_m1_pro_14_1tb"
+
+
 def test_macbook_chip_not_dropped_when_size_precedes_it(tracker):
     # The core bug: M-chip was silently lost when size came before it, so M1
     # and M4 collapsed into one bucket. They must now be distinct.
