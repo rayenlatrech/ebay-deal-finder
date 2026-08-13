@@ -107,6 +107,34 @@ categories:
     priority: 1.0
     min_discount: 18
 
+  # Android tablets. Low priority and a high discount bar: they depreciate
+  # faster and have a much smaller resale pool than iPads, so only a clear
+  # bargain is worth surfacing. Old generations are filtered by
+  # excluded_product_patterns in settings.yaml.
+  - name: "Galaxy Tablets"
+    query: 'Samsung Galaxy Tab -case -cover -parts -broken -keyboard'
+    category_id: "171485"
+    min_price: 150
+    max_price: 900
+    priority: 0.8
+    min_discount: 22
+
+  - name: "Xiaomi Tablets"
+    query: 'Xiaomi Pad -case -cover -parts -broken -keyboard'
+    category_id: "171485"
+    min_price: 100
+    max_price: 500
+    priority: 0.7
+    min_discount: 25
+
+  - name: "Redmi Tablets"
+    query: 'Redmi Pad -case -cover -parts -broken -keyboard'
+    category_id: "171485"
+    min_price: 80
+    max_price: 350
+    priority: 0.6
+    min_discount: 25
+
   - name: "AirPods"
     query: 'AirPods -case -cover -parts -broken -only -singola'
     category_id: "112529"

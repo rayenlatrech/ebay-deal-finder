@@ -146,6 +146,32 @@ def test_multi_model_listings_lose_confidence(tracker, title, is_multi):
     assert key.endswith("_multi") is is_multi
 
 
+@pytest.mark.parametrize("title,expected_key", [
+    ("Samsung Galaxy Tab S11 Ultra 512GB", "galaxy_tab_s11_ultra_512gb"),
+    ("Samsung Galaxy Tab S10 FE 128GB", "galaxy_tab_s10_fe_128gb"),
+    ("Samsung Galaxy Tab S9 8GB 256GB", "galaxy_tab_s9_256gb"),   # RAM ignored
+    ("Xiaomi Pad 7 Pro 256GB", "xiaomi_pad_7_pro_256gb"),
+    ("Xiaomi Pad mini 256GB", "xiaomi_pad_mini_256gb"),
+    ("Mi Pad 6 128GB", "xiaomi_pad_6_128gb"),
+    ("Redmi Pad 2 Pro 256GB", "redmi_pad_2_pro_256gb"),
+    ("Redmi Pad SE 128GB", "redmi_pad_se_128gb"),
+])
+def test_android_tablet_classification(tracker, title, expected_key):
+    key, confidence = tracker.generate_product_key(title)
+    assert key == expected_key
+    assert confidence >= PriceTracker.MIN_CONFIDENCE
+
+
+def test_tablet_never_collapses_into_its_phone_family(tracker):
+    # "Galaxy Tab S9" contains "Galaxy" and "S9"; without the tablet anchor
+    # taking precedence, a ~EUR250 tablet would poison the S9 handset baseline.
+    tab, _ = tracker.generate_product_key("Samsung Galaxy Tab S9 256GB")
+    phone, _ = tracker.generate_product_key("Samsung Galaxy S9 64GB")
+    assert tab == "galaxy_tab_s9_256gb"
+    assert phone == "galaxy_s9_64gb"
+    assert tab != phone
+
+
 def test_unparseable_falls_back_to_epid(tracker):
     assert tracker.generate_product_key("Strange unparseable thing") == ("", 0.0)
     assert tracker.generate_product_key("Strange unparseable thing", epid="123456") == ("epid_123456", 0.9)

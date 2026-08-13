@@ -52,6 +52,12 @@ scanning:
     # The lookahead must end on "_" or end-of-string — "\b" fails here because
     # regex counts "_" as a word character, so "a57_256gb" would be excluded.
     - '^galaxy_a(?!57(?:_|$))\d+'
+    # Tablets: keep only current generations. Current lineups are Galaxy Tab
+    # S9/S10/S11, Xiaomi Pad 6/7, Redmi Pad 2/SE/Pro. Each lookahead ends on
+    # "_" or end-of-string so "s10"/"s11" aren't caught by the "s1" rule.
+    - '^galaxy_tab_s[1-8](?:_|$)'      # Tab S8 and older
+    - '^galaxy_tab_a'                  # budget A-series tablets resell poorly
+    - '^xiaomi_pad_[1-5](?:_|$)'       # Pad 5 and older
 
   # Title patterns that make a unit a bad buy in Italy regardless of price:
   # carrier-locked handsets, iCloud-locked devices, and non-EU market stock

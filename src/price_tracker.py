@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 # "Switch 2" where the price-defining token sits anywhere in the title.
 FAMILY_ANCHORS = [
     ("iphone", re.compile(r"\biphone\b", re.IGNORECASE)),
+    # Tablets must be anchored before their phone family, otherwise
+    # "Galaxy Tab S9" matches the phone pattern and a €250 tablet lands in the
+    # Galaxy S9 handset bucket.
+    ("galaxy_tab", re.compile(r"\bgalaxy\s*tab\b", re.IGNORECASE)),
+    ("redmi_pad", re.compile(r"\bredmi\s*pad\b", re.IGNORECASE)),
+    ("xiaomi_pad", re.compile(r"\b(?:xiaomi|mi)\s*pad\b", re.IGNORECASE)),
     ("galaxy", re.compile(r"\bgalaxy\b", re.IGNORECASE)),
     ("macbook", re.compile(r"\bmacbook\b", re.IGNORECASE)),
     ("ipad", re.compile(r"\bipad\b", re.IGNORECASE)),
@@ -73,7 +79,8 @@ STORAGE_PATTERN = re.compile(r"(\d+)\s*(gb|tb)", re.IGNORECASE)
 # Smallest believable SSD on a Mac/iPad. A smaller figure in one of those
 # titles is RAM, not storage, so it must not become the bucket's storage tier.
 MIN_COMPUTER_STORAGE_GB = 64
-COMPUTER_FAMILIES = ("macbook", "ipad")
+# Families whose titles routinely quote RAM alongside storage.
+COMPUTER_FAMILIES = ("macbook", "ipad", "galaxy_tab", "xiaomi_pad", "redmi_pad")
 
 # eBay conditionId for "For parts or not working"
 FOR_PARTS_CONDITION_ID = "7000"
@@ -521,6 +528,9 @@ class PriceTracker:
         builders = {
             "iphone": self._iphone_key,
             "galaxy": self._galaxy_key,
+            "galaxy_tab": self._galaxy_tab_key,
+            "xiaomi_pad": self._xiaomi_pad_key,
+            "redmi_pad": self._redmi_pad_key,
             "macbook": self._mac_key,
             "ipad": self._ipad_key,
             "xbox": self._xbox_key,
@@ -566,6 +576,44 @@ class PriceTracker:
         elif re.search(r"\bfe\b", t):
             base += "_fe"
         return base + self._storage_suffix(t)
+
+    def _galaxy_tab_key(self, t: str) -> str:
+        m = re.search(r"tab\s*(s\d{1,2}|a\d{1,2})", t)
+        if not m:
+            return ""
+        base = "galaxy_tab_" + re.sub(r"\s+", "", m.group(1))
+        if re.search(r"ultra", t):
+            base += "_ultra"
+        elif re.search(r"\bfe\b", t):
+            base += "_fe"
+        elif re.search(r"plus|\+", t):
+            base += "_plus"
+        elif re.search(r"lite", t):
+            base += "_lite"
+        return base + self._storage_suffix(t, "galaxy_tab")
+
+    def _xiaomi_pad_key(self, t: str) -> str:
+        if re.search(r"\bmini\b", t):
+            return "xiaomi_pad_mini" + self._storage_suffix(t, "xiaomi_pad")
+        m = re.search(r"pad\s*(\d{1,2})", t)
+        if not m:
+            return ""
+        base = f"xiaomi_pad_{m.group(1)}"
+        if re.search(r"\bpro\b", t):
+            base += "_pro"
+        elif re.search(r"\bmax\b", t):
+            base += "_max"
+        return base + self._storage_suffix(t, "xiaomi_pad")
+
+    def _redmi_pad_key(self, t: str) -> str:
+        m = re.search(r"redmi\s*pad\s*(\d{1,2})?", t)
+        generation = m.group(1) if (m and m.group(1)) else ""
+        base = "redmi_pad" + (f"_{generation}" if generation else "")
+        if re.search(r"\bpro\b", t):
+            base += "_pro"
+        elif re.search(r"\bse\b", t):
+            base += "_se"
+        return base + self._storage_suffix(t, "redmi_pad")
 
     def _mac_key(self, t: str) -> str:
         m = re.search(r"macbook\s*(pro|air)?", t)
