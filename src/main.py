@@ -384,7 +384,18 @@ def run_pipeline() -> None:
         analysis_cache = db.get_recent_analyses(
             [c["listing"]["item_id"] for c in candidates], cache_since
         )
+        # Never replay an assessment produced during an AI outage: it scores the
+        # listing as unknown/not-a-deal, so caching it would keep suppressing
+        # real deals for the whole cache window.
+        stale_failures = [k for k, v in analysis_cache.items() if v.get("ai_failed")]
+        for key in stale_failures:
+            del analysis_cache[key]
+        if stale_failures:
+            logger.info(
+                "Ignoring %d cached assessment(s) from a failed AI run", len(stale_failures)
+            )
         cache_hits = 0
+        score_debug: list[dict] = []
 
         for candidate in candidates:
             listing = candidate["listing"]
@@ -514,6 +525,13 @@ def run_pipeline() -> None:
 
                 deal_class = scorer.classify_deal(deal_score)
 
+                score_debug.append({
+                    "deal": deal_score, "price": candidate["price_score"],
+                    "cond": condition_score, "seller": seller_score,
+                    "img": image_score, "qual": listing_quality,
+                    "key": candidate["product_key"],
+                })
+
                 # Merge all analysis data
                 full_analysis = {
                     **text_analysis,
@@ -616,6 +634,18 @@ def run_pipeline() -> None:
                 "AI cache: %d/%d candidates reused a stored assessment (%d fresh calls)",
                 cache_hits, len(candidates), len(candidates) - cache_hits,
             )
+        # Score spread makes a quiet scan diagnosable: without it a run of all
+        # zeros is indistinguishable from "scored 58 and just missed the bar".
+        if score_debug:
+            score_debug.sort(key=lambda s: s["deal"], reverse=True)
+            logger.info("Top scores this run (threshold: good=%d hot=%d):",
+                        scorer.thresholds["good_deal"], scorer.thresholds["hot_deal"])
+            for s in score_debug[:8]:
+                logger.info(
+                    "  deal=%-3d price=%-3d cond=%-3d seller=%-3d img=%-3d qual=%-3d %s",
+                    s["deal"], s["price"], s["cond"], s["seller"],
+                    s["img"], s["qual"], s["key"],
+                )
 
         # ── Record which sellers produced deals ──────────────────────
         try:

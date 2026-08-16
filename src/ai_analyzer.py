@@ -87,7 +87,9 @@ Return ONLY valid JSON (no markdown, no explanation):
         """Initialize AI clients from environment variables."""
         self.db = db_instance
         self.gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-        self.groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        # llama-3.3-70b-versatile was retired by Groq on 2026-08-16; gpt-oss-120b
+        # is their recommended replacement and is a larger model.
+        self.groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
         # Cerebras serves the same 70B class model with a far larger free daily
         # token budget, so it backs Groq up rather than replacing the model.
         self.cerebras_key = os.environ.get("CEREBRAS_API_KEY")
@@ -322,8 +324,14 @@ Return ONLY valid JSON (no markdown, no explanation):
         return parsed
 
     def _default_text_analysis(self) -> dict[str, Any]:
-        """Return default analysis when AI is unavailable."""
+        """Return default analysis when AI is unavailable.
+
+        Flagged so it is never reused from cache: these defaults score a listing
+        as unknown/not-a-deal, and replaying them for days would suppress real
+        deals long after the AI outage that produced them.
+        """
         return {
+            "ai_failed": True,
             "condition_assessment": "unknown",
             "red_flags": [],
             "hidden_defects": [],
@@ -397,8 +405,9 @@ Return ONLY valid JSON (no markdown, no explanation):
             return None
 
     def _default_image_analysis(self) -> dict[str, Any]:
-        """Return default image analysis when unavailable."""
+        """Return default image analysis when unavailable (never cached)."""
         return {
+            "ai_failed": True,
             "photo_type": "uncertain",
             "photo_confidence": 0.0,
             "photo_signals": [],
