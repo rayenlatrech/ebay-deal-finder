@@ -288,6 +288,29 @@ class EbayClient:
             logger.warning("Failed to parse item details for %s: %s", item_id, e)
             return None
 
+    # Home domain per marketplace, used to rewrite links so they open in the
+    # user's eBay app rather than a browser.
+    MARKETPLACE_DOMAINS = {
+        "EBAY_IT": "www.ebay.it", "EBAY_DE": "www.ebay.de", "EBAY_FR": "www.ebay.fr",
+        "EBAY_ES": "www.ebay.es", "EBAY_NL": "www.ebay.nl", "EBAY_BE": "www.ebay.be",
+        "EBAY_GB": "www.ebay.co.uk", "EBAY_US": "www.ebay.com",
+    }
+
+    @classmethod
+    def home_item_url(cls, item_id: str, marketplace: str) -> str:
+        """Build a listing URL on `marketplace`'s domain from any item id.
+
+        eBay item numbers are global, so a listing found on one site can be
+        opened on another. The Browse API id looks like "v1|123456789|0"; the
+        middle segment is the legacy item number the /itm/ path expects.
+        """
+        domain = cls.MARKETPLACE_DOMAINS.get(str(marketplace or "").upper())
+        parts = str(item_id or "").split("|")
+        legacy = parts[1] if len(parts) > 1 else parts[0]
+        if not domain or not legacy.isdigit():
+            return ""
+        return f"https://{domain}/itm/{legacy}"
+
     def item_is_active(self, item_id: str, marketplace: Optional[str] = None) -> Optional[bool]:
         """Lightweight liveness check for sold-price tracking.
 

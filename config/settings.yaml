@@ -20,6 +20,19 @@ ebay:
     - EBAY_NL
     - EBAY_BE
   ship_to_country: "IT"
+  # Only consider items physically located in the EU customs union. A US, UK,
+  # Swiss or Chinese seller may well ship to Italy, but the buyer then pays
+  # import VAT and customs handling on arrival, which erases the discount the
+  # scanner just measured. Note GB is deliberately absent post-Brexit.
+  eu_only: true
+  eu_countries:
+    [AT, BE, BG, HR, CY, CZ, DK, EE, FI, FR, DE, GR, HU, IE, IT,
+     LV, LT, LU, MT, NL, PL, PT, RO, SK, SI, ES, SE]
+  # Foreign sites like ebay.nl are not full national marketplaces, and their
+  # URLs don't deep-link into the eBay mobile app. eBay item numbers are global,
+  # so alert links are rewritten onto the home domain, which opens in the app
+  # and shows the listing priced for delivery to Italy.
+  rewrite_urls_to_home: true
 
 # "Trusted seller" definition — an established seller with a strong record.
 # Used twice: as a hard gate on cross-border listings, and to split the

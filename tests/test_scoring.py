@@ -116,6 +116,24 @@ def test_collapse_duplicates_passes_through_unkeyed_deals():
     assert len(TelegramNotifier.collapse_duplicates(deals)) == 1
 
 
+@pytest.mark.parametrize("item_id,expected", [
+    ("v1|335678901234|0", "https://www.ebay.it/itm/335678901234"),
+    ("226012345678", "https://www.ebay.it/itm/226012345678"),
+    ("bad-id", ""),          # unparseable -> caller keeps the original url
+    ("", ""),
+])
+def test_home_item_url_rewrite(item_id, expected):
+    # Foreign domains (ebay.nl) don't deep-link into the eBay app, and item
+    # numbers are global, so links are rebuilt on the home domain.
+    from src.ebay_client import EbayClient
+    assert EbayClient.home_item_url(item_id, "EBAY_IT") == expected
+
+
+def test_home_item_url_unknown_marketplace_is_skipped():
+    from src.ebay_client import EbayClient
+    assert EbayClient.home_item_url("v1|123456789|0", "EBAY_XX") == ""
+
+
 def test_overpriced_scores_zero(scorer):
     score, discount, _ = scorer.calculate_price_score(120.0, 100.0)
     assert score == 0

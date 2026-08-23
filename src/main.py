@@ -157,6 +157,22 @@ def run_pipeline() -> None:
         stats["total_scanned"] = len(listings)
         logger.info("Found %d listings across all categories", len(listings))
 
+        # Point every alert link at the home marketplace so it opens in the
+        # eBay app (foreign domains such as ebay.nl are handed to the browser).
+        if ebay_cfg.get("rewrite_urls_to_home", True):
+            home_market = ebay_cfg.get("marketplace", "EBAY_IT")
+            rewritten = 0
+            for listing in listings:
+                if listing.get("marketplace") == home_market:
+                    continue
+                home_url = EbayClient.home_item_url(listing["item_id"], home_market)
+                if home_url:
+                    listing["original_item_url"] = listing.get("item_url", "")
+                    listing["item_url"] = home_url
+                    rewritten += 1
+            if rewritten:
+                logger.info("Rewrote %d foreign listing URL(s) onto the home domain", rewritten)
+
         # ── Bad-unit title filter ────────────────────────────────────
         # Carrier-locked, iCloud-locked and non-EU stock are bad buys at any
         # price, so they're dropped before anything else looks at them.
@@ -177,6 +193,32 @@ def run_pipeline() -> None:
             if blocked:
                 stats["skipped"] += blocked
                 logger.info("Dropped %d listing(s) matching bad-unit title patterns", blocked)
+
+        # ── Customs gate: EU-located items only ──────────────────────
+        # Foreign sweeps filter on "ships to Italy", which a US or UK seller can
+        # satisfy — but the buyer then pays import VAT and customs handling,
+        # wiping out the measured discount. Keep purchases inside the EU
+        # customs union. Items with no stated location get the benefit of the
+        # doubt but are counted, so a large number here would be visible.
+        if ebay_cfg.get("eu_only", True):
+            eu = {c.upper() for c in ebay_cfg.get("eu_countries", [])}
+            kept_eu, non_eu, unknown_loc = [], 0, 0
+            for listing in listings:
+                country = str(listing.get("item_location_country") or "").upper()
+                if not country:
+                    unknown_loc += 1
+                    kept_eu.append(listing)
+                elif country in eu:
+                    kept_eu.append(listing)
+                else:
+                    non_eu += 1
+            if non_eu:
+                stats["skipped"] += non_eu
+                logger.info(
+                    "Dropped %d non-EU listing(s) (customs/import VAT would erase the discount); "
+                    "%d had no stated location", non_eu, unknown_loc,
+                )
+            listings = kept_eu
 
         # ── Cross-border trust gate ──────────────────────────────────
         # Foreign listings are only considered from established, well-rated
