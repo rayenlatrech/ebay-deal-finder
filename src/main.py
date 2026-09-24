@@ -102,7 +102,9 @@ def run_pipeline() -> None:
     """
     from src.db import Database
     from src.ebay_client import EbayClient
-    from src.ai_analyzer import AIAnalyzer
+    from src.ai_analyzer import (
+        AIAnalyzer, split_assessment, text_assessment_reusable, image_assessment_reusable,
+    )
     from src.deal_scorer import DealScorer, is_trusted_seller
     from src.price_tracker import (
         PriceTracker, is_for_parts, condition_band, baseline_key,
@@ -148,12 +150,24 @@ def run_pipeline() -> None:
 
         listings = ebay.search_all_categories(
             categories=config["categories"],
-            max_pages=ebay_cfg.get("max_pages_per_category", 2),
-            results_per_page=ebay_cfg.get("results_per_page", 50),
+            max_pages=ebay_cfg.get("max_pages_per_category", 1),
+            results_per_page=ebay_cfg.get("results_per_page", 200),
             foreign_marketplaces=ebay_cfg.get("foreign_marketplaces", []),
             ship_to_country=ebay_cfg.get("ship_to_country", "IT"),
-            include_auctions=ebay_cfg.get("include_auctions", False),
         )
+
+        # Auctions get their own sweep sorted by end time: sorted by newest they
+        # never came close enough to ending to judge (0 alerts in 30 runs).
+        if ebay_cfg.get("include_auctions", False):
+            auctions = ebay.search_ending_auctions(
+                categories=config["categories"],
+                max_hours=ebay_cfg.get("auction_ending_within_hours", 10),
+                foreign_marketplaces=ebay_cfg.get("foreign_marketplaces", []),
+                ship_to_country=ebay_cfg.get("ship_to_country", "IT"),
+            )
+            known = {l["item_id"] for l in listings}
+            listings.extend(a for a in auctions if a["item_id"] not in known)
+
         stats["total_scanned"] = len(listings)
         logger.info("Found %d listings across all categories", len(listings))
 
@@ -297,7 +311,7 @@ def run_pipeline() -> None:
         # Listings already alerted on, fetched once instead of per-listing.
         alerted_ids = db.get_alerted_ids([l["item_id"] for l in listings])
 
-        auction_window_h = ebay_cfg.get("auction_ending_within_hours", 6)
+        auction_window_h = ebay_cfg.get("auction_ending_within_hours", 10)
         now_utc = datetime.now(timezone.utc)
 
         candidates = []
@@ -386,7 +400,21 @@ def run_pipeline() -> None:
                 stats["skipped"] += 1
                 continue
 
+            # An auction's current bid will keep rising, so the useful number is
+            # the most it's still worth paying: the price that would still clear
+            # this category's minimum discount, net of shipping. Entered as an
+            # eBay max bid, proxy bidding holds that line even if the auction
+            # ends long after the alert.
+            max_bid = None
+            if listing.get("is_auction"):
+                shipping = float(listing.get("shipping_cost") or 0)
+                max_bid = round(baseline * (1 - cat_min_discount / 100) - shipping)
+                if max_bid <= float(listing.get("price") or 0):
+                    stats["skipped"] += 1   # already bid past the point of being a deal
+                    continue
+
             candidates.append({
+                "max_bid": max_bid,
                 "band": band,
                 "listing": listing,
                 "product_key": product_key,
@@ -426,22 +454,21 @@ def run_pipeline() -> None:
         analysis_cache = db.get_recent_analyses(
             [c["listing"]["item_id"] for c in candidates], cache_since
         )
-        # Never replay an assessment produced during an AI outage: it scores the
-        # listing as unknown/not-a-deal, so caching it would keep suppressing
-        # real deals for the whole cache window.
-        stale_failures = [k for k, v in analysis_cache.items() if v.get("ai_failed")]
-        for key in stale_failures:
-            del analysis_cache[key]
-        if stale_failures:
-            logger.info(
-                "Ignoring %d cached assessment(s) from a failed AI run", len(stale_failures)
-            )
+        # The text and photo halves of a stored assessment fail independently,
+        # so each is judged on its own. Previously one failed image check marked
+        # the whole assessment unusable, discarding a good text analysis and
+        # forcing it to be paid for again every scan.
         cache_hits = 0
+        image_cache_hits = 0
         score_debug: list[dict] = []
 
         for candidate in candidates:
             listing = candidate["listing"]
-            cached = analysis_cache.get(listing["item_id"])
+            cached_text, cached_image = split_assessment(analysis_cache.get(listing["item_id"]))
+            if not text_assessment_reusable(cached_text):
+                cached_text = {}
+            if not image_assessment_reusable(cached_image):
+                cached_image = {}
             try:
                 # Get full item details for description (query the listing's own
                 # marketplace — a foreign item can 404 against the home site).
@@ -461,8 +488,8 @@ def run_pipeline() -> None:
                 listing["discount_pct"] = candidate["discount_pct"]
 
                 # Run AI text analysis (cached result if we've seen this listing)
-                if cached:
-                    text_analysis = cached
+                if cached_text:
+                    text_analysis = cached_text
                     cache_hits += 1
                 else:
                     text_analysis = ai.analyze_listing(listing)
@@ -522,13 +549,15 @@ def run_pipeline() -> None:
                                 f"image_reused_by_{seller_count}_sellers"
                             )
 
-                # A cached assessment already carries the photo verdict, so the
-                # image never needs downloading or re-analysing.
-                if cached and cached.get("photo_type"):
-                    image_analysis = cached
-                    photo_type = cached.get("photo_type", "uncertain")
+                # Reuse a genuine stored photo verdict. One that failed, or an
+                # image that was never analysed, is retried instead of being
+                # locked in as "uncertain" for the whole cache window.
+                if cached_image:
+                    image_analysis = cached_image
+                    image_cache_hits += 1
+                    photo_type = cached_image.get("photo_type", "uncertain")
                     image_score = _image_score_for(
-                        photo_type, cached.get("condition_matches_description")
+                        photo_type, cached_image.get("condition_matches_description")
                     )
 
                 # Full image analysis for top candidates
@@ -555,6 +584,10 @@ def run_pipeline() -> None:
                 )
 
                 # ── Step 6: Composite Score ──────────────────────────
+                # The model's own findings (red flags, undisclosed defects,
+                # visible damage, its deal verdict) now count against the score.
+                ai_penalty = scorer.calculate_ai_penalty(text_analysis, image_analysis)
+
                 deal_score = scorer.calculate_composite_score(
                     price_score=candidate["price_score"],
                     condition_score=condition_score,
@@ -563,6 +596,7 @@ def run_pipeline() -> None:
                     listing_quality_score=listing_quality,
                     stock_photo_penalty=stock_penalty,
                     is_suspicious=candidate["is_suspicious"],
+                    ai_penalty=ai_penalty,
                 )
 
                 deal_class = scorer.classify_deal(deal_score)
@@ -571,7 +605,7 @@ def run_pipeline() -> None:
                     "deal": deal_score, "price": candidate["price_score"],
                     "cond": condition_score, "seller": seller_score,
                     "img": image_score, "qual": listing_quality,
-                    "key": candidate["product_key"],
+                    "ai": ai_penalty, "key": candidate["product_key"],
                 })
 
                 # Merge all analysis data
@@ -601,6 +635,7 @@ def run_pipeline() -> None:
                     "is_auction": listing.get("is_auction", False),
                     "bid_count": listing.get("bid_count", 0),
                     "hours_left": listing.get("hours_left"),
+                    "max_bid": candidate.get("max_bid"),
                     "seller_trusted": listing.get("seller_trusted", False),
                     "is_foreign": listing.get("is_foreign", False),
                     "marketplace": listing.get("marketplace", ""),
@@ -673,8 +708,10 @@ def run_pipeline() -> None:
 
         if candidates:
             logger.info(
-                "AI cache: %d/%d candidates reused a stored assessment (%d fresh calls)",
+                "AI cache: text reused %d/%d (%d fresh calls), photo verdict reused %d, "
+                "fresh image checks %d",
                 cache_hits, len(candidates), len(candidates) - cache_hits,
+                image_cache_hits, image_analyses_done,
             )
         # Score spread makes a quiet scan diagnosable: without it a run of all
         # zeros is indistinguishable from "scored 58 and just missed the bar".
@@ -684,9 +721,9 @@ def run_pipeline() -> None:
                         scorer.thresholds["good_deal"], scorer.thresholds["hot_deal"])
             for s in score_debug[:8]:
                 logger.info(
-                    "  deal=%-3d price=%-3d cond=%-3d seller=%-3d img=%-3d qual=%-3d %s",
+                    "  deal=%-3d price=%-3d cond=%-3d seller=%-3d img=%-3d qual=%-3d ai=%-4d %s",
                     s["deal"], s["price"], s["cond"], s["seller"],
-                    s["img"], s["qual"], s["key"],
+                    s["img"], s["qual"], s["ai"], s["key"],
                 )
 
         # ── Record which sellers produced deals ──────────────────────

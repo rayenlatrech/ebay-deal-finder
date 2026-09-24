@@ -1,11 +1,39 @@
 """Deal scoring engine — calculates composite scores from multiple signals."""
 
 import logging
+import re
 from typing import Any
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# AI red flags that describe a genuinely risky unit rather than cosmetic wear.
+# The lookbehinds matter: "unlocked" contains "locked", and Italian "sbloccato"
+# (unlocked — a selling point) contains "bloccato" (locked).
+SEVERE_FLAG_RE = re.compile(
+    r"icloud|activation\s*lock|find\s*my|\bfrp\b|google\s*(?:account|lock)|"
+    r"(?<!un)locked|(?<!s)bloccat|blacklist|"
+    r"not\s*working|non\s*funzion|does(?:n'?t|\s*not)\s*work|no\s*power|"
+    r"non\s*si\s*accende|won'?t\s*turn\s*on|"
+    r"broken|\brott[oaie]\b|crack|crepat|incrinat|"
+    r"water|liquid|\bacqua\b|swollen|gonfi|"
+    r"for\s*parts|ricambi|stolen|rubat|replica|counterfeit|\bfake\b|\bfals[oa]\b",
+    re.IGNORECASE,
+)
+
+# Entries models emit to mean "nothing to report"; they must not be penalised.
+_EMPTY_FLAG_RE = re.compile(
+    r"^\s*(?:none|n/?a|no|nothing|nessun[oa]?|none detected|no red flags|-)?\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _real_entries(values: Any) -> list[str]:
+    """Non-empty, meaningful strings from an AI list field."""
+    if not isinstance(values, list):
+        return []
+    return [str(v) for v in values if isinstance(v, (str, int, float)) and not _EMPTY_FLAG_RE.match(str(v))]
 
 # Default "trusted seller" bar, overridable via settings.yaml → seller_trust.
 DEFAULT_MIN_POSITIVE_PCT = 95.0
@@ -178,6 +206,7 @@ class DealScorer:
         listing_quality_score: int,
         stock_photo_penalty: int = 0,
         is_suspicious: bool = False,
+        ai_penalty: int = 0,
     ) -> int:
         """Calculate weighted composite deal score (0-100).
 
@@ -189,6 +218,8 @@ class DealScorer:
             listing_quality_score: Description/photo completeness (0-100)
             stock_photo_penalty: Negative penalty for stock photos
             is_suspicious: Price is implausibly low — apply the scam penalty
+            ai_penalty: Negative penalty from the AI's own verdict (red flags,
+                hidden defects, visible damage) — see calculate_ai_penalty
         """
         raw = (
             price_score * self.weights["price"]
@@ -198,12 +229,60 @@ class DealScorer:
             + listing_quality_score * self.weights["listing_quality"]
         )
 
-        penalty = stock_photo_penalty
+        penalty = stock_photo_penalty + min(0, ai_penalty)
         if is_suspicious:
             penalty += self.suspicious.get("penalty", -25)
 
         final = max(0, min(100, int(raw + penalty)))
         return final
+
+    # ── AI verdict ───────────────────────────────────────────────────
+
+    def calculate_ai_penalty(
+        self, text_analysis: dict[str, Any], image_analysis: dict[str, Any]
+    ) -> int:
+        """Turn the AI's own findings into a score penalty (0 or negative).
+
+        The model reports red flags, functional problems buried in the
+        description (not in the title or condition grade), visible damage and a
+        direct "is this a good deal" verdict. Until now only its
+        condition grade reached the score, so a listing it flagged for iCloud
+        lock or a cracked screen could still alert on price alone.
+
+        Condition is already scored separately, so cosmetic wear is only lightly
+        penalised; severe risks (locks, not working, damage, parts) are heavy.
+        A failed analysis contributes nothing — its defaults aren't findings.
+        """
+        cfg = self.config.get("ai_signals", {})
+        total = 0
+
+        if text_analysis and not text_analysis.get("text_ai_failed"):
+            flags = _real_entries(text_analysis.get("red_flags"))
+            defects = _real_entries(text_analysis.get("hidden_defects"))
+
+            # Severity is a property of the problem, not of which list the model
+            # filed it under: "Face ID not working" is serious either way. The
+            # same issue named in both lists is counted once.
+            severe = {f.strip().lower() for f in flags + defects if SEVERE_FLAG_RE.search(f)}
+            mild_flags = [f for f in flags if not SEVERE_FLAG_RE.search(f)]
+            mild_defects = [d for d in defects if not SEVERE_FLAG_RE.search(d)]
+
+            flag_penalty = (len(severe) * cfg.get("severe_flag_penalty", -20)
+                            + len(mild_flags) * cfg.get("flag_penalty", -5))
+            total += max(flag_penalty, cfg.get("flags_cap", -30))
+            total += max(len(mild_defects) * cfg.get("hidden_defect_penalty", -8),
+                         cfg.get("hidden_defects_cap", -16))
+
+            if text_analysis.get("is_good_deal") is False:
+                total += cfg.get("not_good_deal_penalty", -10)
+
+        if (image_analysis and not image_analysis.get("image_ai_failed")
+                and image_analysis.get("photo_type") == "real"):
+            damage = _real_entries(image_analysis.get("visible_damage"))
+            total += max(len(damage) * cfg.get("visible_damage_penalty", -4),
+                         cfg.get("visible_damage_cap", -12))
+
+        return int(max(total, cfg.get("total_cap", -40)))
 
     # ── Classification ───────────────────────────────────────────────
 

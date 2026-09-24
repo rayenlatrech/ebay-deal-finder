@@ -4,6 +4,7 @@ import base64
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
@@ -115,7 +116,8 @@ class EbayClient:
         marketplace: Optional[str] = None,
         item_location_country: Optional[str] = None,
         delivery_country: Optional[str] = None,
-        include_auctions: bool = False,
+        buying_options: str = "FIXED_PRICE",
+        sort: str = "newlyListed",
     ) -> dict[str, Any]:
         """Search eBay listings with filters.
 
@@ -131,8 +133,7 @@ class EbayClient:
         marketplace = marketplace or self.marketplace
 
         # Build filter string
-        buying = "{FIXED_PRICE|AUCTION}" if include_auctions else "{FIXED_PRICE}"
-        filters = [f"buyingOptions:{buying}"]
+        filters = [f"buyingOptions:{{{buying_options}}}"]
         if item_location_country:
             filters.append(f"itemLocationCountry:{item_location_country}")
         if delivery_country:
@@ -149,7 +150,7 @@ class EbayClient:
             "q": query,
             "category_ids": category_id,
             "filter": ",".join(filters),
-            "sort": "newlyListed",
+            "sort": sort,
             "limit": str(limit),
             "offset": str(page_offset),
             "fieldgroups": "EXTENDED",
@@ -190,6 +191,9 @@ class EbayClient:
             # For an auction the live price is the current bid, not `price`
             # (which eBay may report as the starting or Buy-It-Now amount).
             is_auction = "AUCTION" in buying_options
+            # An auction that also offers Buy It Now carries a price you can pay
+            # immediately — keep it, or the fixed-price sweep can't judge it.
+            buy_it_now = base_price if (is_auction and "FIXED_PRICE" in buying_options) else None
             bid_info = raw.get("currentBidPrice") or {}
             if is_auction and bid_info.get("value") is not None:
                 base_price = float(bid_info["value"])
@@ -200,6 +204,7 @@ class EbayClient:
                 "title": raw.get("title", ""),
                 "price": base_price,
                 "is_auction": is_auction,
+                "buy_it_now_price": buy_it_now,
                 "bid_count": int(raw.get("bidCount") or 0),
                 "auction_end": raw.get("itemEndDate", ""),
                 "shipping_cost": shipping_cost,
@@ -335,39 +340,49 @@ class EbayClient:
 
     # ── Batch Search ─────────────────────────────────────────────────
 
-    def search_all_categories(
-        self,
-        categories: list[dict],
-        max_pages: int = 2,
-        results_per_page: int = 50,
-        foreign_marketplaces: Optional[list[str]] = None,
-        ship_to_country: Optional[str] = None,
-        include_auctions: bool = False,
-    ) -> list[dict]:
-        """Search every configured category across every configured marketplace.
+    def _sweeps(
+        self, foreign_marketplaces: Optional[list[str]], ship_to_country: Optional[str]
+    ) -> list[tuple[str, Optional[str], Optional[str], bool]]:
+        """(marketplace, item_location_country, delivery_country, is_foreign) per site.
 
-        The home marketplace is searched for domestically-located items. Each
-        foreign marketplace is searched for items that ship to
-        ``ship_to_country``; those listings are tagged ``is_foreign`` so the
-        caller can hold them to a stricter seller standard.
-
-        Returns:
-            List of all listing dicts found, de-duplicated by item id.
+        The home site is searched for domestically-located items; each foreign
+        site for items that ship to ``ship_to_country``.
         """
         home_country = ship_to_country or "IT"
-
-        # (marketplace, item_location_country, delivery_country, is_foreign)
         sweeps: list[tuple[str, Optional[str], Optional[str], bool]] = [
             (self.marketplace, home_country, None, False)
         ]
         for mkt in (foreign_marketplaces or []):
             if mkt and mkt != self.marketplace:
                 sweeps.append((mkt, None, home_country, True))
+        return sweeps
 
+    def search_all_categories(
+        self,
+        categories: list[dict],
+        max_pages: int = 1,
+        results_per_page: int = 200,
+        foreign_marketplaces: Optional[list[str]] = None,
+        ship_to_country: Optional[str] = None,
+    ) -> list[dict]:
+        """Search every configured category across every configured marketplace
+        for fixed-price listings, newest first.
+
+        Auctions are deliberately not included: sorted by newest, an auction has
+        a week or more left, so this sweep never surfaced one close enough to its
+        end to judge. They have their own sweep — see search_ending_auctions.
+        Foreign listings are tagged ``is_foreign`` so the caller can hold them to
+        a stricter seller standard.
+
+        Returns:
+            List of all listing dicts found, de-duplicated by item id.
+        """
         all_listings: list[dict] = []
         seen_ids: set[str] = set()
 
-        for marketplace, loc_country, delivery_country, is_foreign in sweeps:
+        for marketplace, loc_country, delivery_country, is_foreign in self._sweeps(
+            foreign_marketplaces, ship_to_country
+        ):
             logger.info("── Sweeping marketplace %s ──", marketplace)
 
             for cat in categories:
@@ -386,7 +401,6 @@ class EbayClient:
                             marketplace=marketplace,
                             item_location_country=loc_country,
                             delivery_country=delivery_country,
-                            include_auctions=include_auctions,
                         )
                     except Exception as e:
                         logger.error(
@@ -403,6 +417,13 @@ class EbayClient:
                         if item["item_id"] not in seen_ids:
                             item["category"] = cat_name
                             item["is_foreign"] = is_foreign
+                            # Auction-with-Buy-It-Now: in this sweep it's judged
+                            # at the price you can pay right now, not the bid.
+                            bin_price = item.get("buy_it_now_price")
+                            if item.get("is_auction") and bin_price:
+                                item["is_auction"] = False
+                                item["price"] = bin_price
+                                item["total_price"] = bin_price + float(item.get("shipping_cost") or 0)
                             all_listings.append(item)
                             seen_ids.add(item["item_id"])
 
@@ -418,3 +439,81 @@ class EbayClient:
 
         logger.info("Total unique listings found: %d", len(all_listings))
         return all_listings
+
+    def search_ending_auctions(
+        self,
+        categories: list[dict],
+        max_hours: float,
+        foreign_marketplaces: Optional[list[str]] = None,
+        ship_to_country: Optional[str] = None,
+        limit: int = 200,
+        max_pages: int = 2,
+    ) -> list[dict]:
+        """Auctions ending within ``max_hours``, soonest first, for every category.
+
+        Sorting by end time means the first page holds exactly the auctions that
+        matter, and paging stops as soon as one ends beyond the window. The
+        category price range still applies to the current bid, which keeps out
+        auctions still sitting at an opening bid — too early to judge.
+        """
+        now = datetime.now(timezone.utc)
+        found: list[dict] = []
+        seen_ids: set[str] = set()
+
+        for marketplace, loc_country, delivery_country, is_foreign in self._sweeps(
+            foreign_marketplaces, ship_to_country
+        ):
+            for cat in categories:
+                for page in range(max_pages):
+                    try:
+                        result = self.search_listings(
+                            query=cat["query"],
+                            category_id=cat["category_id"],
+                            max_price=cat.get("max_price"),
+                            min_price=cat.get("min_price"),
+                            page_offset=page * limit,
+                            limit=limit,
+                            marketplace=marketplace,
+                            item_location_country=loc_country,
+                            delivery_country=delivery_country,
+                            buying_options="AUCTION",
+                            sort="endingSoonest",
+                        )
+                    except Exception as e:
+                        logger.error("Error searching auctions %s/%s: %s", marketplace, cat["name"], e)
+                        break
+
+                    items = result.get("items", [])
+                    beyond_window = False
+                    for item in items:
+                        hours = self._hours_left(item.get("auction_end"), now)
+                        if hours is None:
+                            continue
+                        if hours > max_hours:
+                            beyond_window = True   # sorted, so every later one is too
+                            break
+                        if hours > 0 and item["item_id"] not in seen_ids:
+                            item["category"] = cat["name"]
+                            item["is_foreign"] = is_foreign
+                            item["is_auction"] = True
+                            found.append(item)
+                            seen_ids.add(item["item_id"])
+
+                    if beyond_window or len(items) < limit:
+                        break
+                    time.sleep(0.5)
+                time.sleep(0.3)
+
+        logger.info("Auctions ending within %.0fh: %d", max_hours, len(found))
+        return found
+
+    @staticmethod
+    def _hours_left(end_timestamp: Optional[str], now: datetime) -> Optional[float]:
+        """Hours until an eBay ISO end time, or None if it can't be parsed."""
+        if not end_timestamp:
+            return None
+        try:
+            end = datetime.fromisoformat(str(end_timestamp).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (end - now).total_seconds() / 3600.0

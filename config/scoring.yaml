@@ -33,6 +33,21 @@ suspicious_price:
   max_price_score: 60
   penalty: -25
 
+# Penalties from the AI's own findings (all negative, applied to the composite).
+# Condition is already scored separately, so cosmetic flags are light; severe
+# ones (locks, not working, cracks, water damage, "for parts") are heavy enough
+# that a single one pushes an otherwise hot deal down a tier.
+ai_signals:
+  severe_flag_penalty: -20
+  flag_penalty: -5
+  flags_cap: -30
+  hidden_defect_penalty: -8      # functional problem buried in the description
+  hidden_defects_cap: -16
+  not_good_deal_penalty: -10     # the model explicitly judged it not a deal
+  visible_damage_penalty: -4     # damage visible in a real (non-stock) photo
+  visible_damage_cap: -12
+  total_cap: -40
+
 # Stock photo scoring penalties
 stock_photo_penalties:
   used_item_stock: -25

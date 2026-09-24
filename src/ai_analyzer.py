@@ -14,6 +14,99 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+# Seller_reasoning value written by the text default. Older rows carry no
+# explicit failure flag, so this marker is how their text half is recognised.
+TEXT_FAILURE_MARKER = "AI analysis unavailable"
+
+_RETRY_IN_RE = re.compile(r"try again in\s+([0-9hms.]+)", re.IGNORECASE)
+_DURATION_PART_RE = re.compile(r"([\d.]+)(ms|h|m|s)")
+_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s", re.IGNORECASE)
+
+
+def parse_retry_seconds(message: str) -> Optional[float]:
+    """Seconds to wait from a rate-limit message, or None if none is given.
+
+    Handles Groq's "try again in 5m55.104s" / "510ms" and Gemini's
+    "retryDelay": "33s".
+    """
+    text = message or ""
+    m = _RETRY_IN_RE.search(text)
+    if m:
+        total, found = 0.0, False
+        for value, unit in _DURATION_PART_RE.findall(m.group(1)):
+            try:
+                number = float(value)
+            except ValueError:
+                continue
+            total += number * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[unit]
+            found = True
+        if found:
+            return total
+    m = _RETRY_DELAY_RE.search(text)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def is_daily_quota_error(message: str) -> bool:
+    """True if a rate-limit error is about a daily quota rather than a
+    per-minute one. Only daily exhaustion justifies benching a key for hours."""
+    text = (message or "").lower()
+    return "perday" in text or "per day" in text or "requests per day" in text
+
+
+def text_assessment_reusable(assessment: Optional[dict]) -> bool:
+    """A stored assessment's text half can be reused unless it's the failure default."""
+    if not assessment or not assessment.get("condition_assessment"):
+        return False
+    if assessment.get("text_ai_failed"):
+        return False
+    return assessment.get("seller_reasoning") != TEXT_FAILURE_MARKER
+
+
+def image_assessment_reusable(assessment: Optional[dict]) -> bool:
+    """A stored photo verdict can be reused only if a vision model produced it.
+
+    An image that was never analysed (vision budget spent) or whose analysis
+    failed must be retried later rather than locked in as "uncertain".
+    """
+    if not assessment or assessment.get("image_ai_failed"):
+        return False
+    if assessment.get("image_analyzed"):
+        return True
+    # Rows written before the explicit flag: a real verdict carries a
+    # non-zero photo_confidence, the failure default carries 0.0.
+    try:
+        return float(assessment.get("photo_confidence") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+# Fields belonging to the photo verdict within a stored (merged) assessment.
+IMAGE_ASSESSMENT_KEYS = frozenset({
+    "photo_type", "photo_confidence", "photo_signals", "visible_damage",
+    "condition_matches_description", "estimated_condition", "concerns",
+    "confidence", "image_analyzed", "image_ai_failed",
+})
+
+
+def split_assessment(assessment: Optional[dict]) -> tuple[dict, dict]:
+    """Split a stored assessment into (text_part, image_part).
+
+    Text and photo verdicts are stored merged, but they fail independently, so
+    each half has to be judged and reused on its own. The legacy combined
+    "ai_failed" flag is dropped: it can't say which half failed.
+    """
+    if not assessment:
+        return {}, {}
+    text_part = {
+        k: v for k, v in assessment.items()
+        if k not in IMAGE_ASSESSMENT_KEYS and k not in ("ai_failed", "quick_photo_flags")
+    }
+    image_part = {k: v for k, v in assessment.items() if k in IMAGE_ASSESSMENT_KEYS}
+    return text_part, image_part
+
+
 def _parse_ai_json(text: str) -> dict:
     """Extract and parse JSON from AI response, handling markdown code blocks."""
     # Strip markdown code fences if present
@@ -49,14 +142,25 @@ ANALYZE and return ONLY valid JSON (no markdown, no explanation):
 {{
   "condition_assessment": "mint|good|fair|poor|damaged|parts_only",
   "red_flags": ["list any concerning phrases like 'per ricambi', 'iCloud bloccato', 'schermo rotto', 'no reso' or English equivalents"],
-  "hidden_defects": ["issues mentioned in description but not in title/condition"],
+  "hidden_defects": ["functional problems buried in the description that the title/condition don't reveal"],
   "seller_trust": "high|medium|low",
   "seller_reasoning": "brief explanation of trust rating",
   "negotiable": {negotiable},
   "is_complete_item": true,  // MUST BE FALSE if it is just a box, single earbud, cable, or component part!
   "is_good_deal": true,      // MUST BE FALSE if is_complete_item is false or if broken/parts_only
   "reasoning": "brief explanation in English"
-}}"""
+}}
+
+Rules:
+- A working device sold WITHOUT its box, charger or accessories IS a complete item.
+- red_flags are for real risks: locks (iCloud/Google/carrier), not working, broken
+  or cracked parts, water damage, swollen battery, blacklisted IMEI, "for parts".
+  Normal wear such as light scratches is NOT a red flag — reflect it in
+  condition_assessment instead. Use an empty list when there are none.
+- hidden_defects are FUNCTIONAL problems only (e.g. Face ID not working,
+  battery health below 80%, dead pixels, faulty speaker or camera). A battery
+  health of 80% or more, cosmetic wear, or a missing box/charger is NOT a
+  defect. Use an empty list when there are none."""
 
     IMAGE_ANALYSIS_PROMPT = """You are an expert at analyzing eBay product photos for used electronics.
 
@@ -108,12 +212,22 @@ Return ONLY valid JSON (no markdown, no explanation):
                     self.gemini_keys.append(value)
         
         self._gemini_key_index = 0
+        # Free tier allows ~10 requests/minute per key. Firing image checks
+        # back-to-back tripped it on nearly every run, so each key is paced.
+        self.gemini_min_interval = float(os.environ.get("GEMINI_MIN_INTERVAL_S", "6.5"))
+        self._gemini_last_call: dict[str, float] = {}
 
-        # Initialize Groq client
+        # gpt-oss is a reasoning model; low effort cuts output ~3x (fewer tokens
+        # against the per-minute limit) with no loss for this classification.
+        self.groq_reasoning_effort = os.environ.get("GROQ_REASONING_EFFORT", "low")
+
+        # Initialize Groq client. Its built-in retries back off too briefly for
+        # a saturated per-minute token budget, so retries are handled here with
+        # the wait Groq actually asks for.
         groq_key = os.environ.get("GROQ_API_KEY")
         try:
             from groq import Groq
-            self.groq_client = Groq(api_key=groq_key) if groq_key else None
+            self.groq_client = Groq(api_key=groq_key, max_retries=0) if groq_key else None
         except ImportError:
             self.groq_client = None
             logger.warning("Groq package not installed, text-only fallback unavailable")
@@ -151,8 +265,14 @@ Return ONLY valid JSON (no markdown, no explanation):
         from google import genai
         from google.genai import types
 
-        for attempt in range(len(self.gemini_keys)):
+        # Each key gets a couple of chances: a per-minute limit clears quickly,
+        # so it is waited out rather than treated as the key being used up.
+        max_attempts = len(self.gemini_keys) * 2
+        for attempt in range(max_attempts):
+            if not self.gemini_keys:
+                break
             api_key = self._get_next_gemini_key()
+            self._pace_gemini(api_key)
             try:
                 client = genai.Client(api_key=api_key)
 
@@ -186,27 +306,46 @@ Return ONLY valid JSON (no markdown, no explanation):
                 return response.text
 
             except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "rate" in error_str or "quota" in error_str:
-                    logger.warning(
-                        "Gemini rate limited (key index %d), tracking exhaustion and trying next key",
-                        (self._gemini_key_index - 1) % len(self.gemini_keys),
-                    )
-                    
-                    # Store cooldown in DB (Assume 24 hour reset for safety, or next day)
-                    # We remove the exhausted key from the active list for this session
-                    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-                    reset_time = datetime.now(timezone.utc) + timedelta(hours=24)
-                    self.db.set_key_exhausted(key_hash, reset_time)
-                    
-                    time.sleep(1)
+                message = str(e)
+                lowered = message.lower()
+                if "429" in lowered or "resource_exhausted" in lowered or "quota" in lowered:
+                    if is_daily_quota_error(message):
+                        # Genuinely used up for the day: bench it until the
+                        # daily reset and stop using it for the rest of this run.
+                        logger.warning("Gemini key hit its DAILY quota — benched until reset")
+                        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+                        self.db.set_key_exhausted(key_hash, self._next_gemini_reset())
+                        self.gemini_keys = [k for k in self.gemini_keys if k != api_key]
+                        continue
+                    # Per-minute limit: wait what Gemini asks, then carry on.
+                    # Benching the key for a day here is what used to leave
+                    # image analysis dead for most of every day.
+                    wait = min(parse_retry_seconds(message) or self.gemini_min_interval, 60.0)
+                    logger.info("Gemini per-minute limit, waiting %.1fs", wait)
+                    time.sleep(wait)
                     continue
-                else:
-                    logger.error("Gemini API error: %s", e)
-                    return None
+                logger.error("Gemini API error: %s", message[:300])
+                return None
 
-        logger.warning("All Gemini keys exhausted")
+        logger.warning("Gemini unavailable for this request (%d key(s) active)", len(self.gemini_keys))
         return None
+
+    def _pace_gemini(self, api_key: str) -> None:
+        """Keep each key under the free tier's per-minute request limit."""
+        last = self._gemini_last_call.get(api_key)
+        if last is not None:
+            remaining = self.gemini_min_interval - (time.monotonic() - last)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._gemini_last_call[api_key] = time.monotonic()
+
+    @staticmethod
+    def _next_gemini_reset() -> datetime:
+        """Gemini daily quotas reset at midnight Pacific; 08:00 UTC covers both
+        PST and PDT (it is an hour late in summer, which errs on the safe side)."""
+        now = datetime.now(timezone.utc)
+        reset = now.replace(hour=8, minute=0, second=0, microsecond=0)
+        return reset if reset > now else reset + timedelta(days=1)
 
     # ── Groq Fallback ────────────────────────────────────────────────
 
@@ -216,18 +355,39 @@ Return ONLY valid JSON (no markdown, no explanation):
             logger.error("Groq client not available")
             return None
 
-        try:
-            response = self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=1024,
-                response_format={"type": "json_object"},
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.error("Groq API error: %s", e)
-            return None
+        kwargs: dict[str, Any] = dict(
+            model=self.groq_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            # Requested tokens count against the per-minute budget, so reserve
+            # what low-effort answers actually need (~130-250) plus margin.
+            max_tokens=700,
+            response_format={"type": "json_object"},
+        )
+        if self.groq_model.startswith("openai/gpt-oss") and self.groq_reasoning_effort:
+            kwargs["reasoning_effort"] = self.groq_reasoning_effort
+
+        # Every Groq 429 seen in production was the per-MINUTE token limit with
+        # "try again in <2s". Those are waited out; a daily limit is not.
+        for attempt in range(4):
+            try:
+                response = self.groq_client.chat.completions.create(**kwargs)
+                content = response.choices[0].message.content
+                if content:
+                    return content
+                logger.warning("Groq returned an empty response")
+                return None
+            except Exception as e:
+                message = str(e)
+                is_rate_limit = getattr(e, "status_code", None) == 429 or "429" in message
+                if is_rate_limit and not is_daily_quota_error(message) and attempt < 3:
+                    wait = min((parse_retry_seconds(message) or 2.0) + 0.5, 30.0)
+                    logger.info("Groq per-minute limit, waiting %.1fs (retry %d/3)", wait, attempt + 1)
+                    time.sleep(wait)
+                    continue
+                logger.error("Groq API error: %s", message[:300])
+                return None
+        return None
 
     # ── Cerebras Fallback ────────────────────────────────────────────
 
@@ -326,17 +486,19 @@ Return ONLY valid JSON (no markdown, no explanation):
     def _default_text_analysis(self) -> dict[str, Any]:
         """Return default analysis when AI is unavailable.
 
-        Flagged so it is never reused from cache: these defaults score a listing
-        as unknown/not-a-deal, and replaying them for days would suppress real
-        deals long after the AI outage that produced them.
+        Flagged so its text half is never reused from cache: these defaults score
+        a listing as unknown/not-a-deal, and replaying them for days would
+        suppress real deals long after the outage that produced them. The flag
+        is text-specific so an image failure can't drag a good text result down
+        with it when the two are merged into one stored assessment.
         """
         return {
-            "ai_failed": True,
+            "text_ai_failed": True,
             "condition_assessment": "unknown",
             "red_flags": [],
             "hidden_defects": [],
             "seller_trust": "unknown",
-            "seller_reasoning": "AI analysis unavailable",
+            "seller_reasoning": TEXT_FAILURE_MARKER,
             "negotiable": False,
             "is_good_deal": False,
             "reasoning": "Could not perform AI analysis",
@@ -378,6 +540,9 @@ Return ONLY valid JSON (no markdown, no explanation):
         if not parsed:
             return self._default_image_analysis()
 
+        # Marks a genuine vision verdict so the cache can reuse it — and, just as
+        # importantly, so an image that was never analysed isn't reused as one.
+        parsed["image_analyzed"] = True
         return parsed
 
     def _download_image(self, url: str) -> Optional[bytes]:
@@ -405,9 +570,9 @@ Return ONLY valid JSON (no markdown, no explanation):
             return None
 
     def _default_image_analysis(self) -> dict[str, Any]:
-        """Return default image analysis when unavailable (never cached)."""
+        """Return default image analysis when unavailable (never reused from cache)."""
         return {
-            "ai_failed": True,
+            "image_ai_failed": True,
             "photo_type": "uncertain",
             "photo_confidence": 0.0,
             "photo_signals": [],

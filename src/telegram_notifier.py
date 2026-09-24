@@ -165,6 +165,12 @@ class TelegramNotifier:
             when = f"{hours:.1f}h left" if hours is not None else "ending soon"
             bid_text = f"{bids} bid{'s' if bids != 1 else ''}" if bids else "<b>no bids yet</b>"
             lines.append(f"   🔨 Auction — {when}, {bid_text} (price is the current bid)")
+            max_bid = scores.get("max_bid")
+            if max_bid:
+                lines.append(
+                    f"   💡 <b>Bid up to €{max_bid:.0f}</b> — still a deal at that price. "
+                    f"Enter it as your max bid and eBay bids for you."
+                )
         if shipping:
             lines.append(f"   📦 incl. €{shipping:.0f} shipping")
         drop = scores.get("price_drop_pct")
@@ -294,6 +300,8 @@ class TelegramNotifier:
         if scores.get("is_auction"):
             hours = scores.get("hours_left")
             line += f" 🔨{hours:.0f}h" if hours is not None else " 🔨"
+            if scores.get("max_bid"):
+                line += f" · bid ≤€{scores['max_bid']:.0f}"
         if scores.get("price_drop_pct"):
             line += " 📉"
         dupes = deal.get("duplicate_count", 0)
@@ -339,7 +347,7 @@ class TelegramNotifier:
 
         lines.extend([
             "",
-            "🤝 = Make Offer | 📷 = Stock photo | 📉 = seller cut the price",
+            "🤝 = Make Offer | 📷 = Stock photo | 📉 = price cut | 🔨 = auction",
         ])
         return self._send_message("\n".join(lines))
 

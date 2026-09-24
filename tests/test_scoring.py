@@ -134,6 +134,96 @@ def test_home_item_url_unknown_marketplace_is_skipped():
     assert EbayClient.home_item_url("v1|123456789|0", "EBAY_XX") == ""
 
 
+# ── AI verdict penalty ─────────────────────────────────────────────────────
+
+def test_severe_red_flag_is_penalised_heavily(scorer):
+    text = {"condition_assessment": "good", "red_flags": ["iCloud bloccato"], "is_good_deal": True}
+    assert scorer.calculate_ai_penalty(text, {}) == -20
+
+
+def test_cosmetic_flag_is_only_light(scorer):
+    text = {"condition_assessment": "fair", "red_flags": ["light scratches on back"], "is_good_deal": True}
+    assert scorer.calculate_ai_penalty(text, {}) == -5
+
+
+@pytest.mark.parametrize("flag", ["sbloccato", "Factory unlocked", "SIM-free unlocked phone"])
+def test_unlocked_is_not_mistaken_for_locked(scorer, flag):
+    # "unlocked" contains "locked"; Italian "sbloccato" contains "bloccato".
+    text = {"condition_assessment": "good", "red_flags": [flag], "is_good_deal": True}
+    assert scorer.calculate_ai_penalty(text, {}) == -5   # mild at most, never severe
+
+
+@pytest.mark.parametrize("empty", ["none", "None detected", "N/A", "", "nessuno", "no red flags"])
+def test_placeholder_flags_are_ignored(scorer, empty):
+    text = {"condition_assessment": "good", "red_flags": [empty], "is_good_deal": True}
+    assert scorer.calculate_ai_penalty(text, {}) == 0
+
+
+def test_not_a_deal_verdict_and_hidden_defects_count(scorer):
+    text = {"condition_assessment": "good", "red_flags": [],
+            "hidden_defects": ["battery at 72%"], "is_good_deal": False}
+    assert scorer.calculate_ai_penalty(text, {}) == -8 - 10
+
+
+def test_severe_problem_counts_as_severe_whichever_list_it_is_in(scorer):
+    # "Face ID not working" filed as a hidden defect is still a serious fault.
+    as_defect = {"condition_assessment": "good", "red_flags": [],
+                 "hidden_defects": ["Face ID not working"], "is_good_deal": True}
+    as_flag = {"condition_assessment": "good", "red_flags": ["Face ID not working"],
+               "hidden_defects": [], "is_good_deal": True}
+    assert scorer.calculate_ai_penalty(as_defect, {}) == -20
+    assert scorer.calculate_ai_penalty(as_flag, {}) == -20
+
+
+def test_same_issue_in_both_lists_counts_once(scorer):
+    text = {"condition_assessment": "fair", "red_flags": ["iCloud locked"],
+            "hidden_defects": ["iCloud locked"], "is_good_deal": True}
+    assert scorer.calculate_ai_penalty(text, {}) == -20
+
+
+def test_honest_battery_disclosure_is_not_penalised(scorer):
+    # The live-test regression: a seller stating a healthy battery figure must
+    # not be treated as hiding a defect.
+    text = {"condition_assessment": "good", "red_flags": [], "hidden_defects": [], "is_good_deal": True}
+    assert scorer.calculate_ai_penalty(text, {}) == 0
+
+
+def test_failed_analysis_is_never_penalised(scorer):
+    # The failure default says is_good_deal=False, but that's not a finding.
+    text = {"text_ai_failed": True, "condition_assessment": "unknown",
+            "red_flags": [], "is_good_deal": False}
+    image = {"image_ai_failed": True, "photo_type": "uncertain", "visible_damage": []}
+    assert scorer.calculate_ai_penalty(text, image) == 0
+
+
+def test_visible_damage_only_counts_on_real_photos(scorer):
+    real = {"photo_type": "real", "visible_damage": ["dent on corner", "scratch"]}
+    stock = {"photo_type": "stock", "visible_damage": ["dent on corner"]}
+    assert scorer.calculate_ai_penalty({}, real) == -8
+    assert scorer.calculate_ai_penalty({}, stock) == 0
+
+
+def test_ai_penalty_is_capped(scorer):
+    text = {"condition_assessment": "poor",
+            "red_flags": ["iCloud locked", "cracked screen", "water damage", "not working"],
+            "hidden_defects": ["a", "b", "c"], "is_good_deal": False}
+    image = {"photo_type": "real", "visible_damage": ["x", "y", "z", "w"]}
+    assert scorer.calculate_ai_penalty(text, image) == -40
+
+
+def test_red_flag_drops_a_hot_deal_out_of_hot(scorer):
+    # The production case this fixes: a listing the AI flagged still alerted
+    # purely on price.
+    base = dict(price_score=100, condition_score=75, seller_score=95,
+                image_score=85, listing_quality_score=80)
+    clean = scorer.calculate_composite_score(**base)
+    flagged = scorer.calculate_composite_score(
+        **base, ai_penalty=scorer.calculate_ai_penalty(
+            {"condition_assessment": "good", "red_flags": ["iCloud bloccato"], "is_good_deal": False}, {}))
+    assert scorer.classify_deal(clean) == "hot_deal"
+    assert scorer.classify_deal(flagged) != "hot_deal"
+
+
 def test_overpriced_scores_zero(scorer):
     score, discount, _ = scorer.calculate_price_score(120.0, 100.0)
     assert score == 0

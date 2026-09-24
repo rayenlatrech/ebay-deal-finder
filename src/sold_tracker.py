@@ -72,6 +72,10 @@ class SoldTracker:
             # realized-price stats stay comparable to the deal baselines.
             if is_for_parts(it) or band not in PRICED_BANDS:
                 continue
+            # An auction is seen at a mid-auction bid, not its final price, so
+            # recording it would drag the realized-price stats down.
+            if it.get("is_auction"):
+                continue
             key, conf = self.price_tracker.generate_product_key(
                 it.get("title", ""), it.get("category", ""),
                 it.get("epid", ""), it.get("condition_id", ""),

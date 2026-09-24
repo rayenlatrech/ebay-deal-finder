@@ -1,24 +1,29 @@
 # General settings (all secrets come from environment variables)
 ebay:
   marketplace: "EBAY_IT"
-  results_per_page: 50
-  max_pages_per_category: 2
+  # One 200-result request per category reaches twice as deep as two pages of
+  # 50, for half the calls (200 is the Browse API maximum).
+  results_per_page: 200
+  max_pages_per_category: 1
   # Auctions are where items most often go under market, but a current bid is
-  # not a market price, so auctions never feed baselines — they're only judged
-  # as candidates once they're close to ending and the price is nearly final.
+  # not a market price, so auctions never feed baselines. They have their own
+  # sweep sorted by end time, and each alert carries a suggested max bid.
   include_auctions: true
-  # Must be >= the scan interval or auctions will end unseen between runs.
-  # Scans run every 4h; 6h leaves a 2h buffer for eBay/GitHub scheduling slips.
-  auction_ending_within_hours: 6
+  # Must exceed the longest real gap between scans or auctions end unseen.
+  # GitHub's scheduler fires ~4x/day with gaps measured up to 9h18m. Because
+  # alerts carry a max bid for eBay's proxy bidding, an early alert still works.
+  auction_ending_within_hours: 10
   # Cross-border marketplaces searched in addition to the home one. Only
   # listings that ship to `ship_to_country` are returned, and — because
   # cross-border returns and disputes are far harder — a foreign listing is
   # dropped entirely unless its seller clears the `seller_trust` bar below.
+  # Only DE (84% of results located in Germany) and FR (95%) are real national
+  # marketplaces. NL, BE, ES, AT, IE and PL are international portals — 1-14%
+  # local, 57-78% non-EU stock — so searching them mostly returns listings the
+  # customs gate then throws away.
   foreign_marketplaces:
     - EBAY_DE
     - EBAY_FR
-    - EBAY_NL
-    - EBAY_BE
   ship_to_country: "IT"
   # Only consider items physically located in the EU customs union. A US, UK,
   # Swiss or Chinese seller may well ship to Italy, but the buyer then pays
