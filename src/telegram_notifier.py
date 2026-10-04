@@ -64,7 +64,9 @@ class TelegramNotifier:
                 time.sleep(1)
 
             except requests.exceptions.RequestException as e:
-                logger.error("Failed to send Telegram message: %s", e)
+                # The exception text embeds the request URL, which carries the
+                # bot token — log only the error type.
+                logger.error("Failed to send Telegram message: %s", type(e).__name__)
                 return False
 
         return True

@@ -1,6 +1,6 @@
 # 🔍 eBay AI Deal Finder
 
-An AI-powered bot that scans **eBay Italy** every 6 hours for underpriced used electronics, builds a robust market baseline for each product, and only spends AI tokens on the listings that look genuinely cheap — then alerts you on Telegram. **Total running cost: $0.**
+An AI-powered bot that scans **eBay Italy** every 4 hours for underpriced used electronics, builds a robust market baseline for each product, and only spends AI tokens on the listings that look genuinely cheap — then alerts you on Telegram. **Total running cost: $0.**
 
 ## ✨ Features
 
@@ -11,14 +11,14 @@ An AI-powered bot that scans **eBay Italy** every 6 hours for underpriced used e
 - 📊 **Composite deal scoring** — weighted score from price, condition, seller, images, and listing quality
 - 🤝 **Make Offer detection** — flags negotiable listings with Best Offer available
 - 📱 **Telegram alerts** — instant hot-deal notifications + batched good-deal summaries (HTML-formatted, so messy titles never break a message)
-- ⏰ **Automated via GitHub Actions** — runs every 6 hours; tests run on every push
+- ⏰ **Automated via GitHub Actions** — runs every 4 hours; tests run on every push
 - 🔑 **Multi API key rotation** — supports multiple Gemini keys with DB-backed cooldown tracking
 - 🆓 **100% free** — all services used within their free tiers
 
 ## 🏗️ Architecture
 
 ```
-GitHub Actions (cron every 6h)
+GitHub Actions (cron every 4h)
   → Search eBay Italy via Browse API (newest listings per category)
   → Build a robust market baseline per product bucket   ← see "How the baseline stays clean"
   → Filter: keep only listings ≥15% below their bucket baseline
@@ -163,8 +163,8 @@ CREATE INDEX idx_image_sellers_image ON image_sellers(image_id);
 | `EBAY_CLIENT_ID` | Your eBay Client ID |
 | `EBAY_CLIENT_SECRET` | Your eBay Client Secret |
 | `GROQ_API_KEY` | Your Groq API key |
-| `GEMINI_API_KEY_1` | Gemini API key (account #1) |
-| `GEMINI_API_KEY_2` | Gemini API key (account #2, optional) |
+| `GEMINI_API_KEY_1` | Gemini API key |
+| `GEMINI_API_KEY_2` | Additional Gemini API key (optional) |
 | `TELEGRAM_BOT_TOKEN` | Your Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Your Telegram chat ID |
 | `SUPABASE_URL` | Your Supabase project URL |
@@ -205,7 +205,7 @@ python -m src.main
 ## 📁 Project Structure
 
 ```
-├── .github/workflows/scan.yml   # CI: tests on push, scan on cron (every 6h)
+├── .github/workflows/scan.yml   # CI: tests on push, scan on cron (every 4h)
 ├── src/
 │   ├── main.py                  # Pipeline orchestrator
 │   ├── ebay_client.py           # eBay Browse API client

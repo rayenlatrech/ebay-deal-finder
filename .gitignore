@@ -35,4 +35,7 @@ build/
 
 # Logs
 *.log
-".claude/" 
+
+# Claude Code local settings
+.claude/
+.pytest_cache/

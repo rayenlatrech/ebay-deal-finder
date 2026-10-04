@@ -62,3 +62,17 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           EBAY_MARKETPLACE: EBAY_IT
         run: python -m src.main
+
+  keepalive:
+    # GitHub disables cron workflows in public repos after 60 days without
+    # repo activity. Re-enabling the workflow through the API resets that
+    # timer, so the schedule survives long stretches with no commits.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/scan.yml/enable"
