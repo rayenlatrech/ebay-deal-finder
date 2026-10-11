@@ -36,6 +36,20 @@ def _image_score_for(photo_type: str, condition_matches: Optional[bool]) -> int:
     return 40
 
 
+# The most a photo check can add: real photos that match the description.
+BEST_IMAGE_SCORE = _image_score_for("real", True)
+
+# Why a listing's photo was or wasn't judged by the image model:
+#   checked / checked_earlier — the model looked at the main photo (now / cached)
+#   ai_failed            — the model was called but unavailable
+#   skipped_limit        — the run's image-check budget was used up
+#   skipped_cannot_alert — even a perfect photo couldn't make it a deal
+#   no_photo             — the listing has no image
+# Alerts show this, because "uncertain" from a real check and "never looked"
+# used to read exactly the same.
+PHOTO_REVIEWED = ("checked", "checked_earlier")
+
+
 def _hours_until(timestamp: str, now: datetime) -> Optional[float]:
     """Hours from `now` until an eBay ISO timestamp, or None if unparseable."""
     if not timestamp:
@@ -460,6 +474,7 @@ def run_pipeline() -> None:
         # forcing it to be paid for again every scan.
         cache_hits = 0
         image_cache_hits = 0
+        image_statuses: dict[str, int] = {}
         score_debug: list[dict] = []
 
         for candidate in candidates:
@@ -529,6 +544,23 @@ def run_pipeline() -> None:
                 photo_type = "uncertain"
                 stock_penalty = 0
                 image_analysis = {}
+                image_status = "no_photo"
+
+                # Image checks are capped per run, so don't spend one on a
+                # listing that can't alert even with the best possible photo
+                # verdict — a photo check can only add BEST_IMAGE_SCORE, and its
+                # penalties only subtract. That leaves the budget for listings
+                # whose alert actually depends on it.
+                best_case = scorer.calculate_composite_score(
+                    price_score=candidate["price_score"],
+                    condition_score=condition_score,
+                    seller_score=seller_score,
+                    image_score=BEST_IMAGE_SCORE,
+                    listing_quality_score=listing_quality,
+                    is_suspicious=candidate["is_suspicious"],
+                    ai_penalty=scorer.calculate_ai_penalty(text_analysis, {}),
+                )
+                could_alert = scorer.classify_deal(best_case) in ("hot_deal", "good_deal")
 
                 # Quick free check first
                 quick_check = ai.quick_photo_check(listing)
@@ -555,28 +587,34 @@ def run_pipeline() -> None:
                 if cached_image:
                     image_analysis = cached_image
                     image_cache_hits += 1
+                    image_status = "checked_earlier"
                     photo_type = cached_image.get("photo_type", "uncertain")
                     image_score = _image_score_for(
                         photo_type, cached_image.get("condition_matches_description")
                     )
 
                 # Full image analysis for top candidates
-                elif image_analyses_done < max_image_analyses and image_url:
+                elif image_url and could_alert and image_analyses_done < max_image_analyses:
                     image_analysis = ai.analyze_image(
                         image_url,
                         condition=listing.get("condition", ""),
                         description_excerpt=listing.get("short_description", ""),
                     )
                     image_analyses_done += 1
+                    image_status = "ai_failed" if image_analysis.get("image_ai_failed") else "checked"
 
                     photo_type = image_analysis.get("photo_type", "uncertain")
                     image_score = _image_score_for(
                         photo_type, image_analysis.get("condition_matches_description")
                     )
 
-                elif quick_check.get("suspicious"):
-                    photo_type = "stock"
-                    image_score = 25
+                else:
+                    if image_url:
+                        image_status = "skipped_limit" if could_alert else "skipped_cannot_alert"
+                    if quick_check.get("suspicious"):
+                        photo_type = "stock"
+                        image_score = 25
+                image_statuses[image_status] = image_statuses.get(image_status, 0) + 1
 
                 # Stock photo penalty
                 stock_penalty = scorer.get_stock_photo_penalty(
@@ -643,6 +681,10 @@ def run_pipeline() -> None:
                     "is_suspicious": candidate["is_suspicious"],
                     "seller_trust_level": seller_trust_level,
                     "deal_class": deal_class,
+                    # Kept in scores, not the cached assessment: it describes
+                    # this run, not the listing.
+                    "image_status": image_status,
+                    "text_reviewed": not text_analysis.get("text_ai_failed", False),
                 }
 
                 # Save to database
@@ -713,6 +755,8 @@ def run_pipeline() -> None:
                 cache_hits, len(candidates), len(candidates) - cache_hits,
                 image_cache_hits, image_analyses_done,
             )
+            logger.info("Photo review: %s", ", ".join(
+                f"{k}={v}" for k, v in sorted(image_statuses.items())) or "none")
         # Score spread makes a quiet scan diagnosable: without it a run of all
         # zeros is indistinguishable from "scored 58 and just missed the bar".
         if score_debug:

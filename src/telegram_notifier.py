@@ -126,6 +126,64 @@ class TelegramNotifier:
         }
         return mapping.get(trust_level, "⚪ Unknown")
 
+    # ── AI review status ─────────────────────────────────────────────
+
+    # Why the photo wasn't checked, phrased for the alert.
+    _PHOTO_SKIP_REASON = {
+        "ai_failed": "image AI unavailable",
+        "skipped_limit": "this run's photo-check limit was reached",
+        "skipped_cannot_alert": "not prioritised",
+    }
+
+    def _photo_lines(self, analysis: dict[str, Any], scores: dict[str, Any]) -> list[str]:
+        """Describe what is known about the photos — and whether the AI looked.
+
+        An unchecked photo used to read "authenticity uncertain", identical to a
+        photo the model examined and couldn't call. Now the two are distinct.
+        """
+        status = scores.get("image_status")
+        photo_type = analysis.get("photo_type", "")
+        reviewed = status is None or status in ("checked", "checked_earlier")
+
+        if status == "no_photo":
+            return ["📷 ⚠️ <b>Listing has no photo</b> — ask the seller for real pictures."]
+
+        if not reviewed:
+            reason = self._PHOTO_SKIP_REASON.get(status, "not checked")
+            lines = [
+                f"📷 ⚠️ <b>Photos NOT checked by AI</b> ({reason})",
+                "   Look at them yourself before buying.",
+            ]
+            # The free metadata check can still spot a reused catalog image.
+            if photo_type == "stock":
+                lines.append("   Likely a stock image: the same picture is used by other listings.")
+            return lines
+
+        if photo_type == "stock":
+            return [
+                "📷 ⚠️ <b>NO REAL PHOTOS</b> — Stock/catalog image detected",
+                "   Condition cannot be verified from images.",
+            ]
+        if photo_type == "real":
+            matches = analysis.get("condition_matches_description")
+            if matches is True:
+                return ["📸 ✅ Real photo — matches description (AI checked the main photo)"]
+            if matches is False:
+                return ["📸 ⚠️ Real photo — <b>condition may not match description</b>"]
+            return ["📸 Real photo (AI checked the main photo)"]
+        return ["📷 ❓ AI checked the main photo but couldn't tell if it's genuine"]
+
+    @staticmethod
+    def _review_markers(scores: dict[str, Any]) -> str:
+        """Compact flags for a summary row when the AI skipped part of its review."""
+        marks = ""
+        status = scores.get("image_status")
+        if status is not None and status not in ("checked", "checked_earlier"):
+            marks += " 🙈"
+        if not scores.get("text_reviewed", True):
+            marks += " 📝❌"
+        return marks
+
     # ── Hot Deal Alert ───────────────────────────────────────────────
 
     def send_hot_deal_alert(
@@ -194,29 +252,21 @@ class TelegramNotifier:
 
         lines.append(f"📊 Deal Score: {deal_score}/100")
 
-        # Stock photo warning
-        photo_type = analysis.get("photo_type", "")
-        if photo_type == "stock":
-            lines.extend([
-                "",
-                "📷 ⚠️ <b>NO REAL PHOTOS</b> — Stock/catalog image detected",
-                "   Condition cannot be verified from images.",
-            ])
-        elif photo_type == "uncertain":
-            lines.extend(["", "📷 ❓ Photo authenticity uncertain"])
-        elif photo_type == "real":
-            matches = analysis.get("condition_matches_description")
-            if matches is True:
-                lines.extend(["", "📸 ✅ Real photos — matches description"])
-            elif matches is False:
-                lines.extend(["", "📸 ⚠️ Real photos — <b>condition may not match description</b>"])
+        lines.extend([""] + self._photo_lines(analysis, scores))
 
         # AI condition assessment
-        condition_text = str(analysis.get("condition_assessment", "unknown"))
-        reasoning = analysis.get("reasoning", "")
-        lines.extend(["", f"📝 <b>Condition:</b> {self._esc(condition_text.capitalize())}"])
-        if reasoning:
-            lines.append(f'   AI: "{self._esc(reasoning)}"')
+        if scores.get("text_reviewed", True):
+            condition_text = str(analysis.get("condition_assessment", "unknown"))
+            reasoning = analysis.get("reasoning", "")
+            lines.extend(["", f"📝 <b>Condition:</b> {self._esc(condition_text.capitalize())}"])
+            if reasoning:
+                lines.append(f'   AI: "{self._esc(reasoning)}"')
+        else:
+            lines.extend([
+                "",
+                "📝 ⚠️ <b>Description NOT reviewed by AI</b> (text AI unavailable)",
+                "   Read the description yourself: condition, defects, locks.",
+            ])
 
         # Seller info
         seller_score = listing.get("seller_feedback_score", 0)
@@ -299,6 +349,7 @@ class TelegramNotifier:
             line += " 🤝"
         if deal.get("analysis", {}).get("photo_type", "") == "stock":
             line += " 📷"
+        line += self._review_markers(scores)
         if scores.get("is_auction"):
             hours = scores.get("hours_left")
             line += f" 🔨{hours:.0f}h" if hours is not None else " 🔨"
@@ -350,6 +401,7 @@ class TelegramNotifier:
         lines.extend([
             "",
             "🤝 = Make Offer | 📷 = Stock photo | 📉 = price cut | 🔨 = auction",
+            "🙈 = photos not checked by AI | 📝❌ = description not checked by AI",
         ])
         return self._send_message("\n".join(lines))
 
