@@ -112,7 +112,7 @@ reference:
 #   window: every listing tracked over the last window_days; retail only fills
 #           in when listings are scarce, and caps a used price above new.
 baseline:
-  mode: legacy
+  mode: window
   window_days: 14
   min_listings: 8          # listings that make a market price self-sufficient
   min_blend_listings: 3    # 3-7 listings: blend the market with retail
