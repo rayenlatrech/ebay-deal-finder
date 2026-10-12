@@ -53,6 +53,9 @@ ai:
   cerebras_model: "llama-3.3-70b"
   gemini_model: "gemini-2.5-flash"
   max_image_analyses_per_run: 20
+  # Photos sent per check (main + extras). They share ONE Gemini request, so
+  # this costs tokens, not requests; extras are downsized to keep that small.
+  photos_per_check: 3
   max_text_analyses_per_run: 50
   # Reuse a stored assessment for a listing seen within this many hours. A
   # listing's description and photos don't change, and items sit on eBay for
@@ -102,6 +105,24 @@ reference:
   # baseline (it can suppress a deal, never invent one). Set false to rely
   # exclusively on the manually-curated reference_prices table.
   use_ebay_new_fallback: true
+
+# How a model's market price is built (see src/baseline.py).
+#   legacy: listings posted since the last scan, median of the last 8 scans,
+#           and retail x used_factor as a cap whenever it is lower.
+#   window: every listing tracked over the last window_days; retail only fills
+#           in when listings are scarce, and caps a used price above new.
+baseline:
+  mode: legacy
+  window_days: 14
+  min_listings: 8          # listings that make a market price self-sufficient
+  min_blend_listings: 3    # 3-7 listings: blend the market with retail
+  # When Italy is thin, fill in from these, rescaled by their measured price
+  # gap to Italy (Germany runs ~5% cheaper).
+  topup_marketplaces: [EBAY_DE, EBAY_FR]
+  # Ignore a foreign market for a model if, after rescaling, it is this far from
+  # Italy — that means fakes or misread listings, not a cheaper market.
+  max_topup_gap_pct: 20
+  min_ratio_models: 5      # models needed to measure a market's price gap
 
 telegram:
   batch_good_deals: true

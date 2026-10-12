@@ -76,6 +76,19 @@ FOR_CONTEXT = re.compile(r"(ricambio|ricambi|replacement|compatibile|compatible|
 # largest wins — RAM is always smaller than the SSD it ships with.
 STORAGE_PATTERN = re.compile(r"(\d+)\s*(gb|tb)", re.IGNORECASE)
 
+# Storage tiers devices are actually sold in (GB). Anything else in a title is
+# RAM ("12 GB"), a typo ("265GB") or noise, and used to spawn phantom buckets
+# like galaxy_s25_265gb with their own baselines. 8 GB is deliberately absent:
+# on anything recent it is RAM.
+STORAGE_TIERS_GB = (16, 32, 64, 128, 256, 512, 825, 1024, 2048, 4096, 8192)  # 825: PS5
+# A typo this close to a real tier is snapped to it (126→128, 265→256,
+# 1000→1 TB); further away, the figure is ignored.
+STORAGE_SNAP_TOLERANCE = 0.05
+
+# iPhone model numbers worth a bucket. Older handsets don't hold resale value
+# worth tracking, and a stray figure must not become a model ("iPhone 5G").
+IPHONE_MODEL_NUMBERS = range(6, 20)
+
 # Smallest believable SSD on a Mac/iPad. A smaller figure in one of those
 # titles is RAM, not storage, so it must not become the bucket's storage tier.
 MIN_COMPUTER_STORAGE_GB = 64
@@ -487,25 +500,34 @@ class PriceTracker:
         being read as a 16 GB machine, which used to split one laptop across
         two buckets and halve each one's baseline sample count.
         """
-        best: Optional[tuple[int, str, str]] = None  # (size_in_gb, number, unit)
+        best: Optional[int] = None  # tier in GB
         for size, unit in STORAGE_PATTERN.findall(t):
             try:
                 value = int(size)
             except ValueError:
                 continue
-            unit = unit.lower()
-            in_gb = value * 1024 if unit == "tb" else value
-            if best is None or in_gb > best[0]:
-                best = (in_gb, size, unit)
+            in_gb = value * 1024 if unit.lower() == "tb" else value
+            tier = PriceTracker._snap_storage(in_gb)
+            if tier is not None and (best is None or tier > best):
+                best = tier
 
         if best is None:
             return ""
-        in_gb, size, unit = best
         # On a computer, a figure this small is RAM — better no storage tier
         # than a wrong one.
-        if family in COMPUTER_FAMILIES and in_gb < MIN_COMPUTER_STORAGE_GB:
+        if family in COMPUTER_FAMILIES and best < MIN_COMPUTER_STORAGE_GB:
             return ""
-        return f"_{size}{unit}"
+        return f"_{best // 1024}tb" if best >= 1024 else f"_{best}gb"
+
+    @staticmethod
+    def _snap_storage(in_gb: int) -> Optional[int]:
+        """The real storage tier a title figure denotes, or None if it isn't one."""
+        if in_gb <= 0:
+            return None
+        nearest = min(STORAGE_TIERS_GB, key=lambda tier: abs(tier - in_gb))
+        if abs(nearest - in_gb) / nearest <= STORAGE_SNAP_TOLERANCE:
+            return nearest
+        return None
 
     @staticmethod
     def _chip_suffix(t: str) -> str:
@@ -543,8 +565,10 @@ class PriceTracker:
         # "iPhone Air" is its own model (no number); unify "iPhone 17 Air" with it.
         if re.search(r"\bair\b", t):
             return "iphone_air" + self._storage_suffix(t)
-        m = re.search(r"iphone\s*(\d{1,2})", t)
-        if not m:
+        # The number must stand alone: "iPhone 256 GB" used to become model 25
+        # and "iPhone 1TB" model 1.
+        m = re.search(r"iphone\s*(\d{1,2})(?!\d)(?!\s*(?:gb|tb|go)\b)", t)
+        if not m or int(m.group(1)) not in IPHONE_MODEL_NUMBERS:
             return ""
         num = m.group(1)
         base = f"iphone_{num}"
@@ -552,7 +576,9 @@ class PriceTracker:
             base += "_pro_max"
         elif re.search(r"\bpro\b", t):
             base += "_pro"
-        elif re.search(r"\bplus\b|\+", t):
+        # "+" only means Plus right after the model number: in "6+128GB" it's
+        # the RAM+storage spec.
+        elif re.search(rf"\bplus\b|iphone\s*{num}\s*\+", t):
             base += "_plus"
         elif re.search(r"\bmini\b", t):
             base += "_mini"
@@ -571,7 +597,9 @@ class PriceTracker:
             base += "_edge"
         elif re.search(r"ultra", t):
             base += "_ultra"
-        elif re.search(r"plus|\+", t):
+        # "+" only means Plus right after the model ("S26+"); in "8+512GB" it's
+        # the RAM+storage spec, which turned an S26 FE into an S26+.
+        elif re.search(r"plus", t) or re.search(re.escape(m.group(1)) + r"\s*\+", t):
             base += "_plus"
         elif re.search(r"\bfe\b", t):
             base += "_fe"

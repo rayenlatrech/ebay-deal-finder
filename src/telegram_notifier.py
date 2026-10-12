@@ -126,6 +126,29 @@ class TelegramNotifier:
         }
         return mapping.get(trust_level, "⚪ Unknown")
 
+    # ── Baseline evidence ────────────────────────────────────────────
+
+    def _baseline_text(self, value: float, scores: dict[str, Any]) -> str:
+        """The price a deal is judged against, with how much evidence backs it."""
+        source = scores.get("baseline_source", "market")
+        n = scores.get("baseline_n")
+        days = scores.get("baseline_days")
+        if n is None:  # legacy baseline: no listing count to report
+            return f"€{value:.0f} {self._esc(source)}"
+        listings = f"{n} listing{'s' if n != 1 else ''}"
+        window = f", {days} days" if days else ""
+        if source == "market":
+            return f"market €{value:.0f} ({listings}{window})"
+        if source == "blend":
+            return f"market ~€{value:.0f} (only {listings}{window}, blended with retail)"
+        if source == "thin market":
+            return f"market ~€{value:.0f} (only {listings}{window} — treat with care)"
+        if source == "new-price cap":
+            return f"€{value:.0f} new price (used listings ask more than new)"
+        if source == "retail estimate":
+            return f"€{value:.0f} retail estimate (too few listings to price it)"
+        return f"€{value:.0f} {self._esc(source)}"
+
     # ── AI review status ─────────────────────────────────────────────
 
     # Why the photo wasn't checked, phrased for the alert.
@@ -164,14 +187,16 @@ class TelegramNotifier:
                 "📷 ⚠️ <b>NO REAL PHOTOS</b> — Stock/catalog image detected",
                 "   Condition cannot be verified from images.",
             ]
+        n = int(analysis.get("photos_reviewed") or 1)
+        checked = "AI checked the main photo" if n == 1 else f"AI checked {n} photos"
         if photo_type == "real":
             matches = analysis.get("condition_matches_description")
             if matches is True:
-                return ["📸 ✅ Real photo — matches description (AI checked the main photo)"]
+                return [f"📸 ✅ Real photos — match the description ({checked})"]
             if matches is False:
-                return ["📸 ⚠️ Real photo — <b>condition may not match description</b>"]
-            return ["📸 Real photo (AI checked the main photo)"]
-        return ["📷 ❓ AI checked the main photo but couldn't tell if it's genuine"]
+                return [f"📸 ⚠️ Real photos — <b>condition may not match description</b> ({checked})"]
+            return [f"📸 Real photos ({checked})"]
+        return [f"📷 ❓ {checked} but couldn't tell if they're genuine"]
 
     @staticmethod
     def _review_markers(scores: dict[str, Any]) -> str:
@@ -200,7 +225,6 @@ class TelegramNotifier:
         shipping = listing.get("shipping_cost", 0) or 0
         avg_price = scores.get("avg_price", 0)
         discount_pct = scores.get("discount_pct", 0)
-        baseline_source = scores.get("baseline_source", "market")
         new_price = scores.get("new_price")
         ebay_avg = scores.get("ebay_avg")
         trust_level = scores.get("seller_trust_level", "unknown")
@@ -217,7 +241,7 @@ class TelegramNotifier:
             header,
             "",
             f"📱 {flag} {self._esc(listing.get('title', 'Unknown'))}".strip(),
-            f"💰 Price: €{price:.0f} (€{avg_price:.0f} {self._esc(baseline_source)}, <b>{discount_pct:.0f}% OFF</b>)",
+            f"💰 Price: €{price:.0f} — <b>{discount_pct:.0f}% under</b> {self._baseline_text(avg_price, scores)}",
         ]
         if scores.get("is_auction"):
             hours = scores.get("hours_left")

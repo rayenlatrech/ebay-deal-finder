@@ -29,6 +29,14 @@ _EMPTY_FLAG_RE = re.compile(
 )
 
 
+# A visible_damage entry that reports the absence of damage ("No significant
+# scratches are visible…"). Only applied to damage: in red flags, "no power" or
+# "no Face ID" are real problems.
+_NO_DAMAGE_RE = re.compile(
+    r"^\s*(?:no|none|nothing|nessun[oa]?|non\s+(?:ci\s+sono|si\s+vedono))\b", re.IGNORECASE,
+)
+
+
 def _real_entries(values: Any) -> list[str]:
     """Non-empty, meaningful strings from an AI list field."""
     if not isinstance(values, list):
@@ -278,7 +286,8 @@ class DealScorer:
 
         if (image_analysis and not image_analysis.get("image_ai_failed")
                 and image_analysis.get("photo_type") == "real"):
-            damage = _real_entries(image_analysis.get("visible_damage"))
+            damage = [d for d in _real_entries(image_analysis.get("visible_damage"))
+                      if not _NO_DAMAGE_RE.match(d)]
             total += max(len(damage) * cfg.get("visible_damage_penalty", -4),
                          cfg.get("visible_damage_cap", -12))
 

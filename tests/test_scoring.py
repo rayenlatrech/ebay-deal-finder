@@ -203,6 +203,13 @@ def test_visible_damage_only_counts_on_real_photos(scorer):
     assert scorer.calculate_ai_penalty({}, stock) == 0
 
 
+def test_no_damage_sentence_is_not_damage(scorer):
+    # Seen live: the model reported the absence of damage inside the list.
+    image = {"photo_type": "real", "visible_damage": [
+        "No significant scratches, cracks, or dents are visible on the back or edges."]}
+    assert scorer.calculate_ai_penalty({}, image) == 0
+
+
 def test_ai_penalty_is_capped(scorer):
     text = {"condition_assessment": "poor",
             "red_flags": ["iCloud locked", "cracked screen", "water damage", "not working"],

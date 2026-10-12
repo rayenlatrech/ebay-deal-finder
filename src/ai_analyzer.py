@@ -5,7 +5,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from io import BytesIO
 
 import requests
@@ -83,10 +83,18 @@ def image_assessment_reusable(assessment: Optional[dict]) -> bool:
 
 
 # Fields belonging to the photo verdict within a stored (merged) assessment.
+_EBAY_IMAGE_SIZE_RE = re.compile(r"(i\.ebayimg\.com/.+/s-l)\d+(\.\w+)$")
+
+
+def _ebay_image_size(url: str, size: int) -> str:
+    """The same eBay photo at another rendition size ("s-l1600" → "s-l960")."""
+    return _EBAY_IMAGE_SIZE_RE.sub(rf"\g<1>{size}\g<2>", url)
+
+
 IMAGE_ASSESSMENT_KEYS = frozenset({
     "photo_type", "photo_confidence", "photo_signals", "visible_damage",
     "condition_matches_description", "estimated_condition", "concerns",
-    "confidence", "image_analyzed", "image_ai_failed",
+    "confidence", "image_analyzed", "image_ai_failed", "photos_reviewed",
 })
 
 
@@ -164,11 +172,14 @@ Rules:
 
     IMAGE_ANALYSIS_PROMPT = """You are an expert at analyzing eBay product photos for used electronics.
 
-FIRST, determine if this is a real photo of the specific item or a stock/catalog image.
+You are given {photo_count} photo(s) from the same listing; the first is the listing's main photo.
+
+FIRST, determine whether the photos show the specific item for sale or are stock/catalog images.
 Stock photo signs: pure white background, perfect studio lighting, commercially polished, no visible wear, looks like a manufacturer's product page.
 Real photo signs: home/desk background, ambient lighting, visible wear marks, phone camera quality, personal items in background, reflections.
+Sellers often use a catalog image as the main photo and real ones after it: answer "real" if ANY photo clearly shows the actual unit, "stock" only if they are all catalog images.
 
-THEN, if it's a real photo, assess the item's physical condition.
+THEN, assess the item's physical condition from every real photo — check the screen, back and edges for scratches, cracks and dents.
 
 The seller described this item as: "{condition}" condition.
 The listing says: "{description_excerpt}"
@@ -178,7 +189,7 @@ Return ONLY valid JSON (no markdown, no explanation):
   "photo_type": "real|stock|uncertain",
   "photo_confidence": 0.85,
   "photo_signals": ["list specific visual cues"],
-  "visible_damage": ["list any scratches, dents, cracks, discoloration"],
+  "visible_damage": ["each scratch, dent, crack or discoloration you see — [] if none"],
   "condition_matches_description": true,
   "estimated_condition": "mint|good|fair|poor|cannot_assess",
   "concerns": ["any red flags from the image"],
@@ -248,13 +259,15 @@ Return ONLY valid JSON (no markdown, no explanation):
         return key
 
     def _call_gemini(
-        self, prompt: str, image_data: Optional[bytes] = None
+        self, prompt: str, image_data: Optional[bytes | list[bytes]] = None
     ) -> Optional[str]:
         """Call Gemini API with key rotation and retry.
 
         Args:
             prompt: Text prompt
-            image_data: Optional image bytes for vision analysis
+            image_data: Optional image bytes (or a list of them) for vision
+                analysis. Several photos go in ONE request, so they cost one
+                request against the free tier's request limits, not several.
 
         Returns:
             Response text or None if all keys exhausted.
@@ -264,6 +277,8 @@ Return ONLY valid JSON (no markdown, no explanation):
 
         from google import genai
         from google.genai import types
+
+        images = [image_data] if isinstance(image_data, bytes) else list(image_data or [])
 
         # Each key gets a couple of chances: a per-minute limit clears quickly,
         # so it is waited out rather than treated as the key being used up.
@@ -278,20 +293,11 @@ Return ONLY valid JSON (no markdown, no explanation):
 
                 contents: list[Any] = []
 
-                if image_data:
-                    # Build multimodal content
-                    contents.append(
-                        types.Content(
-                            role="user",
-                            parts=[
-                                types.Part.from_bytes(
-                                    data=image_data,
-                                    mime_type="image/jpeg",
-                                ),
-                                types.Part.from_text(text=prompt),
-                            ],
-                        )
-                    )
+                if images:
+                    # Build multimodal content: every photo, then the prompt
+                    parts = [types.Part.from_bytes(data=img, mime_type="image/jpeg") for img in images]
+                    parts.append(types.Part.from_text(text=prompt))
+                    contents.append(types.Content(role="user", parts=parts))
                 else:
                     contents.append(prompt)
 
@@ -423,7 +429,9 @@ Return ONLY valid JSON (no markdown, no explanation):
             logger.error("Cerebras API error: %s", e)
             return None
 
-    def _call_ai(self, prompt: str, image_data: Optional[bytes] = None) -> Optional[str]:
+    def _call_ai(
+        self, prompt: str, image_data: Optional[bytes | list[bytes]] = None
+    ) -> Optional[str]:
         """Cascade text through the cheapest available provider; images to Gemini.
 
         Text order is Groq → Cerebras → Gemini. Gemini is deliberately last for
@@ -506,33 +514,54 @@ Return ONLY valid JSON (no markdown, no explanation):
 
     # ── Image Analysis ───────────────────────────────────────────────
 
+    # The main photo keeps more detail; extra photos are sized to fit a single
+    # 768px tile, the cheapest size Gemini bills beyond a thumbnail.
+    MAIN_PHOTO_MAX_DIM = 1024
+    EXTRA_PHOTO_MAX_DIM = 768
+
     def analyze_image(
         self,
         image_url: str,
         condition: str = "",
         description_excerpt: str = "",
+        extra_image_urls: Sequence[str] = (),
     ) -> dict[str, Any]:
-        """Analyze a product image for stock photo detection and condition assessment.
+        """Analyze a listing's photos for stock photo detection and condition.
+
+        The main photo is often the front only (or a catalog shot); the next
+        photos usually show the back and edges, where damage actually shows.
+        All photos go in one request, so extras don't cost extra requests.
 
         Args:
-            image_url: URL of the product image
+            image_url: URL of the listing's main image
             condition: Seller-stated condition
             description_excerpt: Brief excerpt of listing description
+            extra_image_urls: Further photos of the same listing to include
 
         Returns:
             Dict with photo_type, visible_damage, condition assessment, etc.
         """
-        # Download image
-        image_data = self._download_image(image_url)
-        if not image_data:
+        images = []
+        main = self._download_image(image_url, self.MAIN_PHOTO_MAX_DIM) if image_url else None
+        if main:
+            images.append(main)
+        for url in extra_image_urls:
+            if url and url != image_url:
+                # eBay serves every photo at 1600px; the 960px rendition is a
+                # third of the download and is shrunk to 768px regardless.
+                extra = self._download_image(_ebay_image_size(url, 960), self.EXTRA_PHOTO_MAX_DIM)
+                if extra:
+                    images.append(extra)
+        if not images:
             return self._default_image_analysis()
 
         prompt = self.IMAGE_ANALYSIS_PROMPT.format(
+            photo_count=len(images),
             condition=condition or "not specified",
             description_excerpt=description_excerpt[:500] or "no description",
         )
 
-        response = self._call_ai(prompt, image_data)
+        response = self._call_ai(prompt, images)
         if not response:
             return self._default_image_analysis()
 
@@ -543,18 +572,18 @@ Return ONLY valid JSON (no markdown, no explanation):
         # Marks a genuine vision verdict so the cache can reuse it — and, just as
         # importantly, so an image that was never analysed isn't reused as one.
         parsed["image_analyzed"] = True
+        parsed["photos_reviewed"] = len(images)
         return parsed
 
-    def _download_image(self, url: str) -> Optional[bytes]:
-        """Download an image and return as bytes."""
+    def _download_image(self, url: str, max_dim: int = MAIN_PHOTO_MAX_DIM) -> Optional[bytes]:
+        """Download an image and return it as JPEG bytes, at most `max_dim` px."""
         try:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
 
             # Validate it's actually an image and resize if too large
             img = Image.open(BytesIO(resp.content))
-            # Resize to max 1024px on longest side to save API tokens
-            max_dim = 1024
+            # Resize on the longest side to save API tokens
             if max(img.size) > max_dim:
                 ratio = max_dim / max(img.size)
                 new_size = (int(img.width * ratio), int(img.height * ratio))

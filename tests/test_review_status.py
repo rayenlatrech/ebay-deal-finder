@@ -50,7 +50,7 @@ def test_checked_but_undecided_photo_reads_differently(notifier):
 def test_checked_real_photo(notifier):
     msg = _hot(notifier, {"photo_type": "real", "condition_matches_description": True},
                image_status="checked_earlier", text_reviewed=True)
-    assert "matches description" in msg
+    assert "match the description" in msg
     assert "NOT checked" not in msg
 
 
@@ -76,7 +76,7 @@ def test_failed_text_review_is_called_out(notifier):
 def test_legacy_scores_without_status_keep_old_rendering(notifier):
     msg = _hot(notifier, {"photo_type": "real", "condition_matches_description": True,
                           "condition_assessment": "good"})
-    assert "matches description" in msg
+    assert "match the description" in msg
     assert "NOT" not in msg
 
 

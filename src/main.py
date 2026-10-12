@@ -124,6 +124,9 @@ def run_pipeline() -> None:
         PriceTracker, is_for_parts, condition_band, baseline_key,
         PRICED_BANDS,
     )
+    from src.baseline import (
+        compute_window_prices, learn_storage_premiums, reference_new_price, resolve_baseline,
+    )
     from src.sold_tracker import SoldTracker
     from src.telegram_notifier import TelegramNotifier
 
@@ -322,6 +325,40 @@ def run_pipeline() -> None:
             "new": ref_cfg.get("new_factor", 1.00),
         }
 
+        # ── Market window (settings.yaml → baseline.mode: window) ────
+        # Prices every model from all listings tracked over the last N days
+        # instead of the handful posted since the previous scan; see baseline.py.
+        base_cfg = settings.get("baseline", {}) or {}
+        use_window = base_cfg.get("mode", "legacy") == "window"
+        window_days = int(base_cfg.get("window_days", 14))
+        min_listings = int(base_cfg.get("min_listings", 8))
+        min_blend = int(base_cfg.get("min_blend_listings", 3))
+        window_prices: dict = {}
+        premiums: dict = {}
+        if use_window:
+            since = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+            rows = db.get_tracked_since(since)
+            if rows:
+                window_prices, ratios = compute_window_prices(
+                    rows,
+                    home=price_tracker.marketplace_home,
+                    topup_markets=base_cfg.get("topup_marketplaces", []),
+                    min_listings=min_listings,
+                    max_gap_pct=float(base_cfg.get("max_topup_gap_pct", 20)),
+                    min_ratio_models=int(base_cfg.get("min_ratio_models", 5)),
+                )
+                premiums = learn_storage_premiums(window_prices, min_listings)
+                logger.info(
+                    "Market window: %d listings over %dd -> %d buckets (%d with >=%d listings); "
+                    "foreign/home price ratios %s",
+                    len(rows), window_days, len(window_prices),
+                    sum(1 for m in window_prices.values() if m.n >= min_listings), min_listings,
+                    {f"{m}/{b}": round(r, 3) for (m, b), r in ratios.items()},
+                )
+            else:
+                logger.warning("Market window unavailable — using the legacy baseline this run")
+                use_window = False
+
         # Listings already alerted on, fetched once instead of per-listing.
         alerted_ids = db.get_alerted_ids([l["item_id"] for l in listings])
 
@@ -361,42 +398,62 @@ def run_pipeline() -> None:
                 stats["skipped"] += 1
                 continue
 
-            # Compare like with like: a used unit against the used baseline,
-            # a sealed one against the sealed baseline.
-            avg_price = market_prices.get(baseline_key(product_key, band))
-            if not avg_price:
-                stats["skipped"] += 1
-                continue
-
             # Per-category focus knobs
             cat_cfg = category_config.get(listing.get("category", ""), {})
             priority = cat_cfg.get("priority", 1.0)
             cat_min_discount = cat_cfg.get("min_discount", global_min_discount)
             cat_price_scores = cat_cfg.get("price_scores")  # None => global curve
 
-            # ── New-price ceiling ────────────────────────────────────
-            # Priority 1: curated retail price (exact key, then without storage
-            # so one entry covers every storage tier).
-            ref = reference_prices.get(product_key) or reference_prices.get(
-                re.sub(r"_\d+(gb|tb)$", "", product_key)
-            )
-            new_price = float(ref["new_price"]) if ref and ref.get("new_price") else None
-            ceiling_source = "retail"
-            # Priority 2 (free, automatic, optional): eBay's own NEW-condition
-            # baseline for this bucket — asking prices, not true retail, so it's
-            # only a fallback and can be disabled in settings.yaml.
-            if new_price is None and ref_cfg.get("use_ebay_new_fallback", True):
-                new_price = market_prices.get(baseline_key(product_key, "new"))
-                ceiling_source = "eBay new"
+            # Compare like with like: a used unit against the used baseline,
+            # a sealed one against the sealed baseline.
+            baseline_n = None
+            if use_window:
+                # Retail price for this exact storage tier (scaled from a
+                # model-level entry when needed). eBay's own sealed price is
+                # the free fallback for a used unit, when well sampled.
+                new_price = reference_new_price(product_key, reference_prices, window_prices, premiums)
+                if new_price is None and band == "used" and ref_cfg.get("use_ebay_new_fallback", True):
+                    sealed = window_prices.get(baseline_key(product_key, "new"))
+                    if sealed and sealed.n >= min_listings:
+                        new_price = sealed.value
+                market = window_prices.get(baseline_key(product_key, band))
+                resolved = resolve_baseline(
+                    market, new_price, band_factor.get(band, 1.0), min_listings, min_blend,
+                )
+                if not resolved:
+                    stats["skipped"] += 1
+                    continue
+                avg_price = market.value if market else None
+                baseline, baseline_source, baseline_n = resolved.value, resolved.source, resolved.n
+            else:
+                avg_price = market_prices.get(baseline_key(product_key, band))
+                if not avg_price:
+                    stats["skipped"] += 1
+                    continue
 
-            # A used unit can't be worth full retail, so scale the ceiling.
-            baseline = avg_price
-            baseline_source = f"{band} market"
-            if new_price:
-                ceiling = new_price * band_factor.get(band, 1.0)
-                if 0 < ceiling < avg_price:
-                    baseline = ceiling
-                    baseline_source = f"{ceiling_source} anchor"
+                # ── New-price ceiling (legacy) ───────────────────────
+                # Priority 1: curated retail price (exact key, then without
+                # storage so one entry covers every storage tier).
+                ref = reference_prices.get(product_key) or reference_prices.get(
+                    re.sub(r"_\d+(gb|tb)$", "", product_key)
+                )
+                new_price = float(ref["new_price"]) if ref and ref.get("new_price") else None
+                ceiling_source = "retail"
+                # Priority 2 (free, automatic, optional): eBay's own NEW-condition
+                # baseline for this bucket — asking prices, not true retail, so
+                # it's only a fallback and can be disabled in settings.yaml.
+                if new_price is None and ref_cfg.get("use_ebay_new_fallback", True):
+                    new_price = market_prices.get(baseline_key(product_key, "new"))
+                    ceiling_source = "eBay new"
+
+                # A used unit can't be worth full retail, so scale the ceiling.
+                baseline = avg_price
+                baseline_source = f"{band} market"
+                if new_price:
+                    ceiling = new_price * band_factor.get(band, 1.0)
+                    if 0 < ceiling < avg_price:
+                        baseline = ceiling
+                        baseline_source = f"{ceiling_source} anchor"
 
             # Calculate preliminary discount using Total Price (Price + Shipping)
             total_price = listing.get("total_price", listing["price"])
@@ -436,6 +493,7 @@ def run_pipeline() -> None:
                 "ebay_avg": avg_price,          # raw eBay asking baseline
                 "new_price": new_price,         # curated new price, if any
                 "baseline_source": baseline_source,
+                "baseline_n": baseline_n,       # listings behind it (window mode)
                 "price_score": price_score,
                 "discount_pct": discount_pct,
                 "is_suspicious": is_suspicious,
@@ -459,6 +517,7 @@ def run_pipeline() -> None:
         hot_deals: list[dict] = []
         good_deals: list[dict] = []
         max_image_analyses = settings["ai"].get("max_image_analyses_per_run", 20)
+        photos_per_check = settings["ai"].get("photos_per_check", 3)
         image_analyses_done = 0
 
         # A listing's description and photos never change, so reuse any recent
@@ -599,6 +658,11 @@ def run_pipeline() -> None:
                         image_url,
                         condition=listing.get("condition", ""),
                         description_excerpt=listing.get("short_description", ""),
+                        # The back and edges are usually in photos 2-3; they
+                        # ride along in the same request, so cost no extra calls.
+                        extra_image_urls=[
+                            u for u in listing.get("all_image_urls", []) if u != image_url
+                        ][: max(0, photos_per_check - 1)],
                     )
                     image_analyses_done += 1
                     image_status = "ai_failed" if image_analysis.get("image_ai_failed") else "checked"
@@ -666,6 +730,8 @@ def run_pipeline() -> None:
                     "ebay_avg": candidate["ebay_avg"],
                     "new_price": candidate["new_price"],
                     "baseline_source": candidate["baseline_source"],
+                    "baseline_n": candidate["baseline_n"],
+                    "baseline_days": window_days if use_window else None,
                     "condition_band": candidate["band"],
                     "product_key": candidate["product_key"],
                     "price_drop_pct": listing.get("price_drop_pct"),

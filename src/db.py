@@ -333,6 +333,36 @@ class Database:
                 logger.error("Failed to load tracked prices: %s", e)
         return out
 
+    def get_tracked_since(self, since_iso: str) -> list[dict]:
+        """Every tracked listing seen since `since_iso` — the market window.
+
+        One row per listing at its current price, so a long-lived listing counts
+        once rather than once per scan that happened to see it.
+        """
+        rows: list[dict] = []
+        PAGE = 1000
+        start = 0
+        try:
+            while True:
+                resp = (
+                    self.client.table("tracked_listings")
+                    .select("product_key, condition_band, price, marketplace")
+                    .gte("last_seen", since_iso)
+                    .order("id")
+                    .range(start, start + PAGE - 1)
+                    .execute()
+                )
+                batch = resp.data or []
+                rows.extend(batch)
+                if len(batch) < PAGE:
+                    return rows
+                start += PAGE
+        except Exception as e:
+            # A partial window would skew every baseline; the caller falls back
+            # to the legacy baseline for this run instead.
+            logger.error("Failed to load the tracked-listing window: %s", e)
+            return []
+
     def get_stale_tracked(self, stale_before_iso: str, limit: int) -> list[dict]:
         """Active tracked rows not seen since `stale_before_iso`, oldest-checked first."""
         try:

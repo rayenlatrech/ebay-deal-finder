@@ -244,6 +244,69 @@ def test_gemini_daily_limit_benches_the_key_until_reset(monkeypatch, no_sleep):
     assert a.gemini_keys == ["key-b"]
 
 
+def _capture_parts(monkeypatch, analyzer):
+    """Record the image parts each Gemini request carries."""
+    sent = []
+    gtypes = sys.modules["google.genai.types"]
+    monkeypatch.setattr(gtypes.Part, "from_bytes",
+                        staticmethod(lambda **k: sent.append(k["data"]) or "img"), raising=False)
+    calls = []
+    original = analyzer._call_gemini
+    monkeypatch.setattr(analyzer, "_call_gemini",
+                        lambda prompt, image_data=None: calls.append(prompt) or original(prompt, image_data))
+    return sent, calls
+
+
+def test_three_photos_go_in_one_request(monkeypatch, no_sleep):
+    state = _install_fake_genai(monkeypatch, [])
+    a = _gemini_analyzer(["key-a"])
+    sizes = {}
+    monkeypatch.setattr(a, "_download_image",
+                        lambda url, max_dim=1024: sizes.setdefault(url, max_dim) and url.encode())
+    sent, prompts = _capture_parts(monkeypatch, a)
+
+    out = a.analyze_image("https://img/1", extra_image_urls=["https://img/2", "https://img/3"])
+
+    assert state["calls"] == 1                          # one request, not three
+    assert sent == [b"https://img/1", b"https://img/2", b"https://img/3"]
+    assert sizes == {"https://img/1": 1024, "https://img/2": 768, "https://img/3": 768}
+    assert "3 photo(s)" in prompts[0]
+    assert out["photos_reviewed"] == 3 and out["image_analyzed"] is True
+
+
+def test_failed_extra_photo_still_analyses_the_rest(monkeypatch, no_sleep):
+    _install_fake_genai(monkeypatch, [])
+    a = _gemini_analyzer(["key-a"])
+    monkeypatch.setattr(a, "_download_image",
+                        lambda url, max_dim=1024: None if url.endswith("2") else url.encode())
+    sent, _ = _capture_parts(monkeypatch, a)
+    out = a.analyze_image("https://img/1", extra_image_urls=["https://img/2", "https://img/3"])
+    assert sent == [b"https://img/1", b"https://img/3"]
+    assert out["photos_reviewed"] == 2
+
+
+def test_no_downloadable_photo_is_a_failed_check(monkeypatch, no_sleep):
+    state = _install_fake_genai(monkeypatch, [])
+    a = _gemini_analyzer(["key-a"])
+    monkeypatch.setattr(a, "_download_image", lambda url, max_dim=1024: None)
+    out = a.analyze_image("https://img/1", extra_image_urls=["https://img/2"])
+    assert out["image_ai_failed"] is True
+    assert state["calls"] == 0
+
+
+def test_extra_photos_use_ebays_smaller_rendition():
+    from src.ai_analyzer import _ebay_image_size
+    url = "https://i.ebayimg.com/images/g/SqEAAeSwTVlqzIhi/s-l1600.jpg"
+    assert _ebay_image_size(url, 960) == "https://i.ebayimg.com/images/g/SqEAAeSwTVlqzIhi/s-l960.jpg"
+    assert _ebay_image_size("https://example.com/photo.jpg", 960) == "https://example.com/photo.jpg"
+
+
+def test_photos_reviewed_is_cached_with_the_image_half():
+    _, image = split_assessment({"condition_assessment": "good", "photo_type": "real",
+                                 "image_analyzed": True, "photos_reviewed": 3})
+    assert image["photos_reviewed"] == 3
+
+
 def test_gemini_reset_time_is_in_the_future():
     from datetime import datetime, timezone
     assert AIAnalyzer._next_gemini_reset() > datetime.now(timezone.utc)
