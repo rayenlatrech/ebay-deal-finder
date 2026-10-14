@@ -1,0 +1,8 @@
+# Only the deal-check webhook (api/telegram.py) runs on Vercel.
+# app.py is the Streamlit dashboard: left in, Vercel would try to serve it as
+# the project's Python entrypoint.
+app.py
+tests/
+test_*.py
+.github/
+requirements-dev.txt

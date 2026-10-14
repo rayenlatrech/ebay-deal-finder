@@ -258,7 +258,17 @@ class EbayClient:
             all_image_urls.extend(img.get("imageUrl", "") for img in additional_images)
             all_image_urls = [url for url in all_image_urls if url]
 
+            # Cheapest shipping option; the scan keeps its own figure from the
+            # search results, the deal check needs this one.
+            shipping_costs = []
+            for option in data.get("shippingOptions", []) or []:
+                try:
+                    shipping_costs.append(float((option.get("shippingCost") or {}).get("value", 0)))
+                except (TypeError, ValueError):
+                    pass
+
             return {
+                "shipping_cost": min(shipping_costs) if shipping_costs else 0.0,
                 "item_id": data.get("itemId", item_id),
                 "title": data.get("title", ""),
                 "price": float(price_info.get("value", 0)),

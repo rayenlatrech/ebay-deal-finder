@@ -33,6 +33,16 @@ class TelegramNotifier:
 
     # ── Low-Level Send ───────────────────────────────────────────────
 
+    def send_chat_action(self, action: str = "typing") -> None:
+        """Show "typing…" while a deal check runs (best effort)."""
+        try:
+            self.session.post(
+                TELEGRAM_API.format(token=self.token, method="sendChatAction"),
+                json={"chat_id": self.chat_id, "action": action}, timeout=5,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.warning("sendChatAction failed: %s", type(e).__name__)
+
     def _send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         """Send a message via Telegram Bot API.
 

@@ -346,7 +346,7 @@ class Database:
             while True:
                 resp = (
                     self.client.table("tracked_listings")
-                    .select("product_key, condition_band, price, marketplace")
+                    .select("id, product_key, condition_band, price, marketplace, status, last_seen")
                     .gte("last_seen", since_iso)
                     .order("id")
                     .range(start, start + PAGE - 1)

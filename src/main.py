@@ -124,9 +124,7 @@ def run_pipeline() -> None:
         PriceTracker, is_for_parts, condition_band, baseline_key,
         PRICED_BANDS,
     )
-    from src.baseline import (
-        compute_window_prices, learn_storage_premiums, reference_new_price, resolve_baseline,
-    )
+    from src.baseline import MarketWindow
     from src.sold_tracker import SoldTracker
     from src.telegram_notifier import TelegramNotifier
 
@@ -328,36 +326,21 @@ def run_pipeline() -> None:
         # ── Market window (settings.yaml → baseline.mode: window) ────
         # Prices every model from all listings tracked over the last N days
         # instead of the handful posted since the previous scan; see baseline.py.
-        base_cfg = settings.get("baseline", {}) or {}
-        use_window = base_cfg.get("mode", "legacy") == "window"
-        window_days = int(base_cfg.get("window_days", 14))
-        min_listings = int(base_cfg.get("min_listings", 8))
-        min_blend = int(base_cfg.get("min_blend_listings", 3))
-        window_prices: dict = {}
-        premiums: dict = {}
-        if use_window:
-            since = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
-            rows = db.get_tracked_since(since)
-            if rows:
-                window_prices, ratios = compute_window_prices(
-                    rows,
-                    home=price_tracker.marketplace_home,
-                    topup_markets=base_cfg.get("topup_marketplaces", []),
-                    min_listings=min_listings,
-                    max_gap_pct=float(base_cfg.get("max_topup_gap_pct", 20)),
-                    min_ratio_models=int(base_cfg.get("min_ratio_models", 5)),
-                )
-                premiums = learn_storage_premiums(window_prices, min_listings)
+        window = None
+        if (settings.get("baseline", {}) or {}).get("mode", "legacy") == "window":
+            window = MarketWindow.load(db, settings, price_tracker.marketplace_home)
+            if window:
                 logger.info(
                     "Market window: %d listings over %dd -> %d buckets (%d with >=%d listings); "
                     "foreign/home price ratios %s",
-                    len(rows), window_days, len(window_prices),
-                    sum(1 for m in window_prices.values() if m.n >= min_listings), min_listings,
-                    {f"{m}/{b}": round(r, 3) for (m, b), r in ratios.items()},
+                    len(window.rows), window.days, len(window.prices),
+                    sum(1 for m in window.prices.values() if m.n >= window.min_listings),
+                    window.min_listings,
+                    {f"{m}/{b}": round(r, 3) for (m, b), r in window.ratios.items()},
                 )
             else:
                 logger.warning("Market window unavailable — using the legacy baseline this run")
-                use_window = False
+        use_window = window is not None
 
         # Listings already alerted on, fetched once instead of per-listing.
         alerted_ids = db.get_alerted_ids([l["item_id"] for l in listings])
@@ -408,22 +391,13 @@ def run_pipeline() -> None:
             # a sealed one against the sealed baseline.
             baseline_n = None
             if use_window:
-                # Retail price for this exact storage tier (scaled from a
-                # model-level entry when needed). eBay's own sealed price is
-                # the free fallback for a used unit, when well sampled.
-                new_price = reference_new_price(product_key, reference_prices, window_prices, premiums)
-                if new_price is None and band == "used" and ref_cfg.get("use_ebay_new_fallback", True):
-                    sealed = window_prices.get(baseline_key(product_key, "new"))
-                    if sealed and sealed.n >= min_listings:
-                        new_price = sealed.value
-                market = window_prices.get(baseline_key(product_key, band))
-                resolved = resolve_baseline(
-                    market, new_price, band_factor.get(band, 1.0), min_listings, min_blend,
-                )
+                resolved = window.judge(product_key, band)
                 if not resolved:
                     stats["skipped"] += 1
                     continue
+                market = window.prices.get(baseline_key(product_key, band))
                 avg_price = market.value if market else None
+                new_price = resolved.new_price
                 baseline, baseline_source, baseline_n = resolved.value, resolved.source, resolved.n
             else:
                 avg_price = market_prices.get(baseline_key(product_key, band))
@@ -731,7 +705,7 @@ def run_pipeline() -> None:
                     "new_price": candidate["new_price"],
                     "baseline_source": candidate["baseline_source"],
                     "baseline_n": candidate["baseline_n"],
-                    "baseline_days": window_days if use_window else None,
+                    "baseline_days": window.days if use_window else None,
                     "condition_band": candidate["band"],
                     "product_key": candidate["product_key"],
                     "price_drop_pct": listing.get("price_drop_pct"),

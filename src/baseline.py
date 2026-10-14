@@ -291,3 +291,67 @@ def resolve_baseline(
     if lower_estimate is not None:
         return Baseline(round(lower_estimate, 2), "retail estimate", n, new_price)
     return None
+
+
+# ── Shared entry point (scan + Telegram deal check) ──────────────────────
+
+@dataclass
+class MarketWindow:
+    """Everything needed to judge a price, loaded once per scan or request."""
+
+    prices: dict[str, MarketPrice]
+    premiums: dict[tuple[str, int, int], float]
+    references: dict[str, dict]
+    ratios: dict[tuple[str, str], float]
+    rows: list[dict]
+    days: int
+    band_factor: dict[str, float]
+    min_listings: int = 8
+    min_blend_listings: int = 3
+    use_ebay_new_fallback: bool = True
+
+    @classmethod
+    def load(cls, db, settings: dict, home: str) -> Optional["MarketWindow"]:
+        """Build the window from settings.yaml; None if the data can't be read."""
+        from datetime import datetime, timedelta, timezone
+
+        base_cfg = settings.get("baseline", {}) or {}
+        ref_cfg = settings.get("reference", {}) or {}
+        days = int(base_cfg.get("window_days", 14))
+        min_listings = int(base_cfg.get("min_listings", 8))
+        rows = db.get_tracked_since((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
+        if not rows:
+            return None
+        prices, ratios = compute_window_prices(
+            rows, home=home,
+            topup_markets=base_cfg.get("topup_marketplaces", []),
+            min_listings=min_listings,
+            max_gap_pct=float(base_cfg.get("max_topup_gap_pct", 20)),
+            min_ratio_models=int(base_cfg.get("min_ratio_models", 5)),
+        )
+        return cls(
+            prices=prices,
+            premiums=learn_storage_premiums(prices, min_listings),
+            references=db.get_reference_prices(),
+            ratios=ratios,
+            rows=rows,
+            days=days,
+            band_factor={"used": ref_cfg.get("used_factor", 0.75), "new": ref_cfg.get("new_factor", 1.0)},
+            min_listings=min_listings,
+            min_blend_listings=int(base_cfg.get("min_blend_listings", 3)),
+            use_ebay_new_fallback=bool(ref_cfg.get("use_ebay_new_fallback", True)),
+        )
+
+    def judge(self, product_key: str, band: str) -> Optional[Baseline]:
+        """The baseline a listing of this product and condition is judged against."""
+        new_price = reference_new_price(product_key, self.references, self.prices, self.premiums)
+        # eBay's own sealed price is the free fallback for a used unit's
+        # new-price cap, but only when it is well sampled.
+        if new_price is None and band == "used" and self.use_ebay_new_fallback:
+            sealed = self.prices.get(baseline_key(product_key, "new"))
+            if sealed and sealed.n >= self.min_listings:
+                new_price = sealed.value
+        return resolve_baseline(
+            self.prices.get(baseline_key(product_key, band)), new_price,
+            self.band_factor.get(band, 1.0), self.min_listings, self.min_blend_listings,
+        )

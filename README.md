@@ -11,7 +11,8 @@ An AI-powered bot that scans **eBay Italy** every 4 hours for underpriced used e
 - 📊 **Composite deal scoring** — weighted score from price, condition, seller, images, and listing quality
 - 🤝 **Make Offer detection** — flags negotiable listings with Best Offer available
 - 📱 **Telegram alerts** — instant hot-deal notifications + batched good-deal summaries (HTML-formatted, so messy titles never break a message)
-- ⏰ **Automated via GitHub Actions** — runs every 4 hours; tests run on every push
+- 💬 **Deal-check bot** — message the bot a device, condition and price (or an eBay link) and get a verdict against the market, the most to pay, and an AI review
+- ⏰ **Automated via GitHub Actions** — started every 4 hours on the dot by an external cron; tests run on every push
 - 🔑 **Multi API key rotation** — supports multiple Gemini keys with DB-backed cooldown tracking
 - 🆓 **100% free** — all services used within their free tiers
 
@@ -202,16 +203,58 @@ python -m src.main
 > 🔒 **Never commit secrets.** Keep all keys in `.env` (which is git-ignored).
 > Don't keep a second plaintext copy of keys anywhere in the repo.
 
+### 6. On-time scans (cron-job.org)
+
+GitHub's own cron is best-effort: scans start up to ~1.5 h late and some slots
+are dropped. A free external cron starts them on time instead; GitHub's
+schedule stays as a backup that skips itself when a scan already ran.
+
+1. **GitHub token** — Settings → Developer settings → Personal access tokens →
+   *Fine-grained tokens* → Generate. Repository access: *Only select
+   repositories* → this repo. Permissions: **Actions → Read and write**
+   (nothing else). Set a reminder for its expiry date.
+2. **cron-job.org** (free account) → *Create cronjob*:
+   - URL: `https://api.github.com/repos/<you>/<repo>/actions/workflows/scan.yml/dispatches`
+   - Schedule: every day, hours `0,4,8,12,16,20`, minute `0`, time zone **UTC**
+   - Advanced → Request method **POST**, request body `{"ref":"main"}`, headers:
+     `Accept: application/vnd.github+json`, `Authorization: Bearer <token>`,
+     `X-GitHub-Api-Version: 2022-11-28`
+3. *Test run* — expect HTTP **204**, and a new `workflow_dispatch` run in the
+   Actions tab.
+
+### 7. Deal-check bot (Vercel, optional)
+
+Message the bot `iPhone 15 Pro 256GB usato 550€` (or paste an eBay link) and it
+replies with the market price, a verdict, the most to pay and an AI review. It
+runs as one serverless function, `api/telegram.py`, on Vercel's free plan.
+
+1. vercel.com → sign in with GitHub → *Add New → Project* → import this repo,
+   Framework Preset **Other**.
+2. Environment variables: the same as `.env` (`EBAY_*`, `GROQ_API_KEY`,
+   `GEMINI_API_KEY_*`, `SUPABASE_URL`, `SUPABASE_KEY`, `TELEGRAM_BOT_TOKEN`,
+   `TELEGRAM_CHAT_ID`) plus **`TELEGRAM_WEBHOOK_SECRET`** — any long random
+   string; put the same value in your local `.env`.
+3. Deploy, then open `https://<project>.vercel.app/api/telegram` — it should say
+   *deal-check bot is up*.
+4. Point Telegram at it: `python scripts/set_telegram_webhook.py https://<project>.vercel.app/api/telegram`
+
+Only your chat (`TELEGRAM_CHAT_ID`) is answered, and only requests carrying the
+webhook secret are accepted.
+
 ## 📁 Project Structure
 
 ```
-├── .github/workflows/scan.yml   # CI: tests on push, scan on cron (every 4h)
+├── .github/workflows/scan.yml   # CI: tests on push, scan every 4h (external cron + backup)
+├── api/telegram.py              # Vercel webhook: the deal-check bot
+├── scripts/                     # One-off setup helpers (Telegram webhook)
 ├── src/
 │   ├── main.py                  # Pipeline orchestrator
 │   ├── ebay_client.py           # eBay Browse API client
 │   ├── ai_analyzer.py           # Groq (text) + Gemini (vision) analysis
 │   ├── deal_scorer.py           # Composite scoring engine
-│   ├── price_tracker.py         # Classification + robust market baseline
+│   ├── price_tracker.py         # Product classification
+│   ├── baseline.py              # 14-day market window + retail safety net
+│   ├── deal_check.py            # Answers the bot's "is this a good deal?" messages
 │   ├── telegram_notifier.py     # Telegram alert sender (HTML)
 │   └── db.py                    # Supabase database wrapper
 ├── tests/                       # Classifier + baseline robustness tests
@@ -246,9 +289,11 @@ classifier is and how much support a bucket needs before its baseline is trusted
 | eBay Browse API | 5,000/day | ~280/day | Search + item details |
 | Groq | 14,400/day | ~200/day | **Primary** text/description analysis |
 | Google Gemini (×2 keys) | 3,000/day | ~80/day | Image/condition verification |
-| GitHub Actions | 2,000 min/mo | ~300 min/mo | Scheduling + tests |
+| GitHub Actions | Unlimited (public repo) | ~1,800 min/mo | Scans + tests |
 | Supabase | 500 MB | < 50 MB | Listings, analyses, price history |
 | Telegram | Unlimited | ~20 msgs/day | Alerts |
+| Vercel (Hobby) | 300 s/function | a few calls/day | Deal-check bot webhook |
+| cron-job.org | Free | 6 calls/day | On-time scan triggers |
 
 ## 📄 License
 

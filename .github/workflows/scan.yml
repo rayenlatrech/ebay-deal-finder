@@ -5,10 +5,13 @@ on:
     branches: [main, master]
   pull_request:
   schedule:
-    # Run every 4 hours: 00, 04, 08, 12, 16, 20 (UTC)
-    - cron: '0 */4 * * *'
+    # BACKUP only. Scans are started on time by an external cron (cron-job.org
+    # calling workflow_dispatch at 00, 04, 08, 12, 16, 20 UTC), because GitHub's
+    # own cron fires up to ~1.5h late and drops slots under load. This runs 30
+    # min after each slot and skips itself if a scan already ran (see guard).
+    - cron: '30 */4 * * *'
   workflow_dispatch:
-    # Allow manual trigger from GitHub Actions UI
+    # The external cron's trigger, and manual runs from the Actions UI
 
 jobs:
   test:
@@ -34,21 +37,48 @@ jobs:
     # Five marketplace sweeps plus reconciliation ran 12m07s at 8 categories;
     # tablets take it to 11, and a killed run loses the scan report entirely.
     timeout-minutes: 30
+    # Never two scans at once (external trigger + backup cron, or a manual run):
+    # a second one waits for the first instead of double-alerting.
+    concurrency:
+      group: deal-scan
+      cancel-in-progress: false
+    permissions:
+      actions: read     # the guard lists recent runs
+      contents: read
 
     steps:
+      - name: Skip the backup cron if a scan already ran
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          recent=$(gh run list -R "$GITHUB_REPOSITORY" -w scan.yml -L 20 \
+            --json databaseId,createdAt,event,conclusion \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }})
+                       | select(.event == \"schedule\" or .event == \"workflow_dispatch\")
+                       | select(.conclusion != \"cancelled\")
+                       | select((now - (.createdAt | fromdateiso8601)) < 9000)] | length")
+          echo "Scans started in the last 2.5h: $recent"
+          if [ "$recent" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+
       - name: Checkout code
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
       - name: Run deal scanner
+        if: steps.guard.outputs.skip != 'true'
         env:
           EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
           EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
