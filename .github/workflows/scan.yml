@@ -7,8 +7,10 @@ on:
   schedule:
     # BACKUP only. Scans are started on time by an external cron (cron-job.org
     # calling workflow_dispatch at 00, 04, 08, 12, 16, 20 UTC), because GitHub's
-    # own cron fires up to ~1.5h late and drops slots under load. This runs 30
-    # min after each slot and skips itself if a scan already ran (see guard).
+    # own cron fires late and drops slots under load. This runs 30 min after
+    # each slot and skips itself if a scan ran in the last 4h — a full interval,
+    # because it has fired as much as 3.5h late (19:56 for the 16:30 slot) and
+    # a shorter look-back let it double up with the next on-time scan.
     - cron: '30 */4 * * *'
   workflow_dispatch:
     # The external cron's trigger, and manual runs from the Actions UI
@@ -58,8 +60,8 @@ jobs:
             --jq "[.[] | select(.databaseId != ${{ github.run_id }})
                        | select(.event == \"schedule\" or .event == \"workflow_dispatch\")
                        | select(.conclusion != \"cancelled\")
-                       | select((now - (.createdAt | fromdateiso8601)) < 9000)] | length")
-          echo "Scans started in the last 2.5h: $recent"
+                       | select((now - (.createdAt | fromdateiso8601)) < 14400)] | length")
+          echo "Scans started in the last 4h: $recent"
           if [ "$recent" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
 
       - name: Checkout code
