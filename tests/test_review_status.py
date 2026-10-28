@@ -60,6 +60,23 @@ def test_metadata_stock_hint_survives_when_unchecked(notifier):
     assert "stock image" in msg
 
 
+@pytest.mark.parametrize("days,relisted,expected", [
+    (0.1, False, "🆕 Listed 2h ago"),
+    (48, True, "♻️ First listed 48 days ago (relisted, still unsold) — ask the seller why"),
+    (35, False, "♻️ First listed 35 days ago (still unsold) — ask the seller why"),
+    (3, True, "♻️ First listed 3 days ago (relisted, still unsold)"),
+])
+def test_age_lines(notifier, days, relisted, expected):
+    msg = _hot(notifier, {"photo_type": "real", "condition_matches_description": True},
+               image_status="checked", text_reviewed=True, listing_age_days=days, relisted=relisted)
+    assert expected in msg
+
+
+def test_ordinary_age_says_nothing(notifier):
+    msg = _hot(notifier, {"photo_type": "real"}, image_status="checked", listing_age_days=4, relisted=False)
+    assert "Listed" not in msg and "♻️" not in msg
+
+
 def test_thumbnail_only_photos(notifier):
     msg = _hot(notifier, {"photo_type": "uncertain"}, image_status="photos_too_small", text_reviewed=True)
     assert "thumbnail-sized" in msg

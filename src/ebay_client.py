@@ -207,6 +207,10 @@ class EbayClient:
                 "buy_it_now_price": buy_it_now,
                 "bid_count": int(raw.get("bidCount") or 0),
                 "auction_end": raw.get("itemEndDate", ""),
+                # First-ever listing date (kept across relists) vs this
+                # listing's own start — see deal_scorer.listing_age.
+                "origin_date": raw.get("itemOriginDate", ""),
+                "creation_date": raw.get("itemCreationDate", ""),
                 "shipping_cost": shipping_cost,
                 "total_price": base_price + shipping_cost,
                 "currency": price_info.get("currency", "EUR"),
@@ -267,8 +271,10 @@ class EbayClient:
                 except (TypeError, ValueError):
                     pass
 
-            return {
+            details = {
                 "shipping_cost": min(shipping_costs) if shipping_costs else 0.0,
+                # getItem has no itemOriginDate, only this listing's start.
+                "creation_date": data.get("itemCreationDate", ""),
                 "item_id": data.get("itemId", item_id),
                 "title": data.get("title", ""),
                 "price": float(price_info.get("value", 0)),
@@ -299,6 +305,7 @@ class EbayClient:
                 },
                 "marketplace": marketplace or self.marketplace,
             }
+            return details
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("Failed to parse item details for %s: %s", item_id, e)
             return None

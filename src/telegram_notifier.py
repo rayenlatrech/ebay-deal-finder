@@ -159,6 +159,26 @@ class TelegramNotifier:
             return f"€{value:.0f} retail estimate (too few listings to price it)"
         return f"€{value:.0f} {self._esc(source)}"
 
+    # ── Listing age ──────────────────────────────────────────────────
+
+    STALE_DAYS = 30
+
+    @classmethod
+    def _age_line(cls, scores: dict[str, Any]) -> str:
+        """Fresh listings are worth acting on fast; old unsold ones need a question."""
+        days = scores.get("listing_age_days")
+        if days is None:
+            return ""
+        relisted = scores.get("relisted")
+        if days >= cls.STALE_DAYS or relisted:
+            when = f"{days:.0f} days ago" if days >= 1.5 else "yesterday"
+            note = "relisted, still unsold" if relisted else "still unsold"
+            ask = " — ask the seller why" if days >= cls.STALE_DAYS else ""
+            return f"♻️ First listed {when} ({note}){ask}"
+        if days < 1:
+            return f"🆕 Listed {max(1, round(days * 24))}h ago — move fast"
+        return ""
+
     # ── AI review status ─────────────────────────────────────────────
 
     # Why the photo wasn't checked, phrased for the alert.
@@ -284,6 +304,10 @@ class TelegramNotifier:
         if new_price and ebay_avg and ebay_avg > new_price * 1.05:
             lines.append(f"   ℹ️ eBay asking avg was €{ebay_avg:.0f} (used new price as the anchor)")
 
+        age_line = self._age_line(scores)
+        if age_line:
+            lines.append(age_line)
+
         if listing.get("negotiable"):
             lines.append("🤝 Price may be negotiable (Make Offer available)")
 
@@ -394,6 +418,8 @@ class TelegramNotifier:
                 line += f" · bid ≤€{scores['max_bid']:.0f}"
         if scores.get("price_drop_pct"):
             line += " 📉"
+        if (scores.get("listing_age_days") or 0) >= self.STALE_DAYS:
+            line += " ♻️"
         dupes = deal.get("duplicate_count", 0)
         if dupes:
             line += f"  <i>(+{dupes} similar)</i>"
@@ -438,7 +464,7 @@ class TelegramNotifier:
         lines.extend([
             "",
             "🤝 = Make Offer | 📷 = Stock photo | 📉 = price cut | 🔨 = auction",
-            "🙈 = photos not checked by AI | 📝❌ = description not checked by AI",
+            "🙈 = photos not checked by AI | 📝❌ = description not checked by AI | ♻️ = unsold 30+ days",
         ])
         return self._send_message("\n".join(lines))
 

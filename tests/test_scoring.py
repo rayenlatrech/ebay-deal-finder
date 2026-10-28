@@ -231,6 +231,34 @@ def test_red_flag_drops_a_hot_deal_out_of_hot(scorer):
     assert scorer.classify_deal(flagged) != "hot_deal"
 
 
+# ── Listing age ────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("days,penalty", [(None, 0), (0.2, 0), (29.9, 0), (30, -8), (89, -8), (90, -15), (1495, -15)])
+def test_age_penalty(scorer, days, penalty):
+    assert scorer.calculate_age_penalty(days) == penalty
+
+
+def test_listing_age_spots_relists():
+    from datetime import datetime, timezone
+    from src.deal_scorer import listing_age
+    now = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+    relist = {"origin_date": "2026-09-10T12:00:00.000Z", "creation_date": "2026-10-28T09:00:00.000Z"}
+    days, relisted = listing_age(relist, now)
+    assert round(days) == 48 and relisted            # "new" listing, really 48 days old
+    fresh = {"origin_date": "2026-10-28T09:00:00.000Z", "creation_date": "2026-10-28T09:00:00.000Z"}
+    days, relisted = listing_age(fresh, now)
+    assert days == pytest.approx(0.125) and not relisted
+    # A single-item lookup only has the creation date
+    assert listing_age({"creation_date": "2026-10-18T12:00:00Z"}, now) == (10.0, False)
+    assert listing_age({}, now) == (None, False)
+    assert listing_age({"origin_date": "garbage"}, now) == (None, False)
+
+
+def test_stale_listing_loses_points(scorer):
+    base = dict(price_score=100, condition_score=75, seller_score=95, image_score=85, listing_quality_score=80)
+    assert scorer.calculate_composite_score(**base, age_penalty=-8) == scorer.calculate_composite_score(**base) - 8
+
+
 def test_overpriced_scores_zero(scorer):
     score, discount, _ = scorer.calculate_price_score(120.0, 100.0)
     assert score == 0

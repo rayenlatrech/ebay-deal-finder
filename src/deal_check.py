@@ -281,6 +281,15 @@ def build_reply(request: DealRequest, product_key: str, band: str, view: MarketV
     lines = [f"🔎 <b>{_esc(pretty_name(product_key))}</b> — {band}"]
     if listing:
         lines.append(f"📱 {_esc(listing.get('title', '')[:90])}")
+        from src.deal_scorer import listing_age
+        days, _ = listing_age(listing)
+        if days is not None:
+            # A single-item lookup has no original listing date, so a relist
+            # can't be told apart here — only this listing's own age.
+            when = f"{days:.0f} days ago" if days >= 1.5 else ("yesterday" if days >= 1 else
+                                                               f"{max(1, round(days * 24))}h ago")
+            hint = " — still unsold, ask why" if days >= 30 else ""
+            lines.append(f"🗓️ Listed {when}{hint}")
 
     b = view.baseline
     lines.append(f"📊 Market: {_baseline_line(b, days)}")

@@ -120,7 +120,7 @@ def run_pipeline() -> None:
     from src.ai_analyzer import (
         AIAnalyzer, split_assessment, text_assessment_reusable, image_assessment_reusable,
     )
-    from src.deal_scorer import DealScorer, is_trusted_seller
+    from src.deal_scorer import DealScorer, is_trusted_seller, listing_age
     from src.price_tracker import (
         PriceTracker, is_for_parts, condition_band, baseline_key,
         PRICED_BANDS,
@@ -667,6 +667,10 @@ def run_pipeline() -> None:
                 # The model's own findings (red flags, undisclosed defects,
                 # visible damage, its deal verdict) now count against the score.
                 ai_penalty = scorer.calculate_ai_penalty(text_analysis, image_analysis)
+                # An item first listed weeks ago and still unsold usually has a
+                # catch, even when a relist makes it look brand new.
+                age_days, relisted = listing_age(listing, now_utc)
+                age_penalty = scorer.calculate_age_penalty(age_days)
 
                 deal_score = scorer.calculate_composite_score(
                     price_score=candidate["price_score"],
@@ -677,6 +681,7 @@ def run_pipeline() -> None:
                     stock_photo_penalty=stock_penalty,
                     is_suspicious=candidate["is_suspicious"],
                     ai_penalty=ai_penalty,
+                    age_penalty=age_penalty,
                 )
 
                 deal_class = scorer.classify_deal(deal_score)
@@ -685,7 +690,7 @@ def run_pipeline() -> None:
                     "deal": deal_score, "price": candidate["price_score"],
                     "cond": condition_score, "seller": seller_score,
                     "img": image_score, "qual": listing_quality,
-                    "ai": ai_penalty, "key": candidate["product_key"],
+                    "ai": ai_penalty, "age": age_penalty, "key": candidate["product_key"],
                 })
 
                 # Merge all analysis data
@@ -729,6 +734,8 @@ def run_pipeline() -> None:
                     # this run, not the listing.
                     "image_status": image_status,
                     "text_reviewed": not text_analysis.get("text_ai_failed", False),
+                    "listing_age_days": round(age_days, 2) if age_days is not None else None,
+                    "relisted": relisted,
                 }
 
                 # Save to database
@@ -809,9 +816,9 @@ def run_pipeline() -> None:
                         scorer.thresholds["good_deal"], scorer.thresholds["hot_deal"])
             for s in score_debug[:8]:
                 logger.info(
-                    "  deal=%-3d price=%-3d cond=%-3d seller=%-3d img=%-3d qual=%-3d ai=%-4d %s",
+                    "  deal=%-3d price=%-3d cond=%-3d seller=%-3d img=%-3d qual=%-3d ai=%-4d age=%-4d %s",
                     s["deal"], s["price"], s["cond"], s["seller"],
-                    s["img"], s["qual"], s["ai"], s["key"],
+                    s["img"], s["qual"], s["ai"], s["age"], s["key"],
                 )
 
         # ── Record which sellers produced deals ──────────────────────

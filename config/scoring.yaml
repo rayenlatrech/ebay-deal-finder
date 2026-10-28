@@ -48,6 +48,16 @@ ai_signals:
   visible_damage_cap: -12
   total_cap: -40
 
+# Listing age, from eBay's itemOriginDate (the FIRST listing date, kept across
+# relists). A genuinely underpriced item doesn't sit unsold for a month: an old
+# "deal" usually has a catch — a fault, a reserve, or a seller who won't sell.
+# Measured: 109 of 200 auctions ending soon were relists, 53 over 30 days old.
+listing_age:
+  stale_days: 30
+  stale_penalty: -8
+  very_stale_days: 90
+  very_stale_penalty: -15
+
 # Stock photo scoring penalties
 stock_photo_penalties:
   used_item_stock: -25

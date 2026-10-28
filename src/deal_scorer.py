@@ -2,7 +2,8 @@
 
 import logging
 import re
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import yaml
 
@@ -42,6 +43,29 @@ def _real_entries(values: Any) -> list[str]:
     if not isinstance(values, list):
         return []
     return [str(v) for v in values if isinstance(v, (str, int, float)) and not _EMPTY_FLAG_RE.match(str(v))]
+
+def listing_age(listing: dict[str, Any], now: Optional[datetime] = None) -> tuple[Optional[float], bool]:
+    """(days since the item was first listed, whether it has been relisted).
+
+    eBay's itemOriginDate survives relists while itemCreationDate restarts, so
+    a gap of a day or more between them means an unsold item put back up —
+    which a "newest first" search would otherwise present as brand new.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    def parse(value: Any) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+        except ValueError:
+            return None
+
+    origin, created = parse(listing.get("origin_date")), parse(listing.get("creation_date"))
+    first = origin or created
+    if first is None:
+        return None, False
+    relisted = bool(origin and created and (created - origin).total_seconds() >= 86400)
+    return max(0.0, (now - first).total_seconds() / 86400), relisted
+
 
 # Default "trusted seller" bar, overridable via settings.yaml → seller_trust.
 DEFAULT_MIN_POSITIVE_PCT = 95.0
@@ -215,6 +239,7 @@ class DealScorer:
         stock_photo_penalty: int = 0,
         is_suspicious: bool = False,
         ai_penalty: int = 0,
+        age_penalty: int = 0,
     ) -> int:
         """Calculate weighted composite deal score (0-100).
 
@@ -228,6 +253,8 @@ class DealScorer:
             is_suspicious: Price is implausibly low — apply the scam penalty
             ai_penalty: Negative penalty from the AI's own verdict (red flags,
                 hidden defects, visible damage) — see calculate_ai_penalty
+            age_penalty: Negative penalty for a listing that has stayed unsold
+                for weeks — see calculate_age_penalty
         """
         raw = (
             price_score * self.weights["price"]
@@ -237,7 +264,7 @@ class DealScorer:
             + listing_quality_score * self.weights["listing_quality"]
         )
 
-        penalty = stock_photo_penalty + min(0, ai_penalty)
+        penalty = stock_photo_penalty + min(0, ai_penalty) + min(0, age_penalty)
         if is_suspicious:
             penalty += self.suspicious.get("penalty", -25)
 
@@ -292,6 +319,19 @@ class DealScorer:
                          cfg.get("visible_damage_cap", -12))
 
         return int(max(total, cfg.get("total_cap", -40)))
+
+    # ── Listing age ──────────────────────────────────────────────────
+
+    def calculate_age_penalty(self, age_days: Optional[float]) -> int:
+        """Penalty (0 or negative) for days since the item was FIRST listed."""
+        if age_days is None:
+            return 0
+        cfg = self.config.get("listing_age", {})
+        if age_days >= cfg.get("very_stale_days", 90):
+            return int(cfg.get("very_stale_penalty", -15))
+        if age_days >= cfg.get("stale_days", 30):
+            return int(cfg.get("stale_penalty", -8))
+        return 0
 
     # ── Classification ───────────────────────────────────────────────
 
