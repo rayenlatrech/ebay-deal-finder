@@ -294,6 +294,86 @@ def test_no_downloadable_photo_is_a_failed_check(monkeypatch, no_sleep):
     assert state["calls"] == 0
 
 
+def test_thumbnails_are_skipped_for_later_photos(monkeypatch, no_sleep):
+    from src.ai_analyzer import TOO_SMALL
+    _install_fake_genai(monkeypatch, [])
+    a = _gemini_analyzer(["key-a"])
+    tiny = {"https://img/1", "https://img/3"}
+    tried = []
+    monkeypatch.setattr(a, "_download_image",
+                        lambda url, max_dim=1024: tried.append(url) or (TOO_SMALL if url in tiny else url.encode()))
+    sent, _ = _capture_parts(monkeypatch, a)
+    out = a.analyze_image("https://img/1", extra_image_urls=[f"https://img/{i}" for i in range(2, 8)])
+    assert sent == [b"https://img/2", b"https://img/4", b"https://img/5"]   # first 3 usable
+    assert tried == [f"https://img/{i}" for i in range(1, 6)]               # stops once it has 3
+    assert out["photos_reviewed"] == 3
+
+
+def test_first_usable_photo_gets_the_detailed_size(monkeypatch, no_sleep):
+    from src.ai_analyzer import TOO_SMALL
+    _install_fake_genai(monkeypatch, [])
+    a = _gemini_analyzer(["key-a"])
+    sizes = {}
+    monkeypatch.setattr(a, "_download_image", lambda url, max_dim=1024: sizes.setdefault(url, max_dim)
+                        and (TOO_SMALL if url.endswith("1") else url.encode()))
+    _capture_parts(monkeypatch, a)
+    a.analyze_image("https://img/1", extra_image_urls=["https://img/2", "https://img/3"])
+    assert sizes["https://img/2"] == 1024 and sizes["https://img/3"] == 768
+
+
+def test_all_thumbnails_spend_no_request(monkeypatch, no_sleep):
+    from src.ai_analyzer import TOO_SMALL, image_assessment_reusable
+    state = _install_fake_genai(monkeypatch, [])
+    a = _gemini_analyzer(["key-a"])
+    monkeypatch.setattr(a, "_download_image", lambda url, max_dim=1024: TOO_SMALL)
+    out = a.analyze_image("https://img/1", extra_image_urls=["https://img/2"])
+    assert out["photos_too_small"] is True
+    assert not out.get("image_ai_failed")
+    assert state["calls"] == 0
+    assert not image_assessment_reusable(out)    # re-checked if the seller adds photos
+
+
+def test_photo_attempts_are_capped(monkeypatch, no_sleep):
+    from src.ai_analyzer import TOO_SMALL
+    _install_fake_genai(monkeypatch, [])
+    a = _gemini_analyzer(["key-a"])
+    tried = []
+    monkeypatch.setattr(a, "_download_image", lambda url, max_dim=1024: tried.append(url) or TOO_SMALL)
+    a.analyze_image("https://img/0", extra_image_urls=[f"https://img/{i}" for i in range(1, 30)])
+    assert len(tried) == a.MAX_PHOTO_ATTEMPTS
+
+
+def test_download_flags_thumbnails(monkeypatch):
+    import io
+    from PIL import Image
+    from src.ai_analyzer import TOO_SMALL
+
+    def png(size):
+        buf = io.BytesIO(); Image.new("RGB", size).save(buf, format="PNG"); return buf.getvalue()
+
+    class _Resp:
+        def __init__(self, content): self.content = content
+        def raise_for_status(self): pass
+
+    a = _gemini_analyzer(["key-a"])
+    monkeypatch.setattr(ai_mod.requests, "get", lambda url, timeout: _Resp(png((80, 80))))
+    assert a._download_image("https://img/x") is TOO_SMALL
+    monkeypatch.setattr(ai_mod.requests, "get", lambda url, timeout: _Resp(png((1600, 1200))))
+    out = a._download_image("https://img/x", 768)
+    assert isinstance(out, bytes) and max(Image.open(io.BytesIO(out)).size) == 768
+
+
+def test_prompts_carry_todays_date():
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%d %B %Y")
+    assert today in AIAnalyzer.IMAGE_ANALYSIS_PROMPT.format(today=today, photo_count=3, condition="x",
+                                                          description_excerpt="y")
+    text = AIAnalyzer.TEXT_ANALYSIS_PROMPT.format(
+        today=today, title="t", price=1, avg_price=1, discount_pct=1, condition="c", buying_options="",
+        description="d", feedback_score=1, feedback_pct=99, negotiable="false")
+    assert today in text and "non-existent" in text
+
+
 def test_extra_photos_use_ebays_smaller_rendition():
     from src.ai_analyzer import _ebay_image_size
     url = "https://i.ebayimg.com/images/g/SqEAAeSwTVlqzIhi/s-l1600.jpg"

@@ -180,6 +180,9 @@ class TelegramNotifier:
 
         if status == "no_photo":
             return ["📷 ⚠️ <b>Listing has no photo</b> — ask the seller for real pictures."]
+        if status == "photos_too_small":
+            return ["📷 ⚠️ <b>Every photo is thumbnail-sized</b> — condition can't be judged. "
+                    "Ask the seller for real pictures."]
 
         if not reviewed:
             reason = self._PHOTO_SKIP_REASON.get(status, "not checked")

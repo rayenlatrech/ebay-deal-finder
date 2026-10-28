@@ -42,6 +42,7 @@ BEST_IMAGE_SCORE = _image_score_for("real", True)
 # Why a listing's photo was or wasn't judged by the image model:
 #   checked / checked_earlier — the model looked at the main photo (now / cached)
 #   ai_failed            — the model was called but unavailable
+#   photos_too_small     — every photo is a thumbnail; nothing to judge
 #   skipped_limit        — the run's image-check budget was used up
 #   skipped_cannot_alert — even a perfect photo couldn't make it a deal
 #   no_photo             — the listing has no image
@@ -634,12 +635,15 @@ def run_pipeline() -> None:
                         description_excerpt=listing.get("short_description", ""),
                         # The back and edges are usually in photos 2-3; they
                         # ride along in the same request, so cost no extra calls.
-                        extra_image_urls=[
-                            u for u in listing.get("all_image_urls", []) if u != image_url
-                        ][: max(0, photos_per_check - 1)],
+                        # The whole gallery is offered so thumbnails can be skipped.
+                        extra_image_urls=[u for u in listing.get("all_image_urls", []) if u != image_url],
+                        max_photos=photos_per_check,
                     )
-                    image_analyses_done += 1
-                    image_status = "ai_failed" if image_analysis.get("image_ai_failed") else "checked"
+                    if image_analysis.get("photos_too_small"):
+                        image_status = "photos_too_small"   # no request was spent
+                    else:
+                        image_analyses_done += 1
+                        image_status = "ai_failed" if image_analysis.get("image_ai_failed") else "checked"
 
                     photo_type = image_analysis.get("photo_type", "uncertain")
                     image_score = _image_score_for(

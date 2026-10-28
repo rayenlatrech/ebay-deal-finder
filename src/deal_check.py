@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import yaml
 
+from src.ai_analyzer import DATE_RULE
 from src.baseline import MarketWindow, normalize_key
 from src.price_tracker import PriceTracker, condition_band, is_for_parts
 
@@ -191,6 +192,7 @@ def verdict(price: float, baseline: float, min_discount: float, suspicious_pct: 
 # ── AI review ────────────────────────────────────────────────────────────
 
 REVIEW_PROMPT = """You help a reseller in Italy judge a second-hand electronics deal.
+""" + DATE_RULE + """
 The user wrote: "{text}"
 
 Market facts (from eBay listings over the last {days} days):
@@ -209,10 +211,10 @@ Respond in English."""
 
 def ai_review(ai, request: DealRequest, product_key: str, band: str,
               market_text: str, days: int) -> dict:
-    from src.ai_analyzer import _parse_ai_json
+    from src.ai_analyzer import _parse_ai_json, _today
 
     prompt = REVIEW_PROMPT.format(
-        text=request.text[:600], days=days, product=product_key, band=band,
+        today=_today(), text=request.text[:600], days=days, product=product_key, band=band,
         market=market_text, price=f"€{request.price:.0f}" if request.price else "not given",
     )
     response = ai._call_ai(prompt)
@@ -401,7 +403,8 @@ class DealChecker:
                 listing.get("image_url", ""), listing.get("condition", ""),
                 listing.get("short_description", ""),
                 extra_image_urls=[u for u in listing.get("all_image_urls", [])
-                                  if u != listing.get("image_url")][: max(0, photos - 1)],
+                                  if u != listing.get("image_url")],
+                max_photos=photos,
             )
             photo_lines = _photo_summary(image)
         else:
@@ -412,6 +415,8 @@ class DealChecker:
 
 
 def _photo_summary(image: dict) -> list[str]:
+    if image.get("photos_too_small"):
+        return ["📷 ⚠️ Every photo is thumbnail-sized — nothing can be judged. Ask for real pictures."]
     if image.get("image_ai_failed"):
         return ["📷 ⚠️ Photos NOT checked (image AI unavailable) — look at them yourself."]
     n = image.get("photos_reviewed") or 1

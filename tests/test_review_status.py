@@ -60,6 +60,11 @@ def test_metadata_stock_hint_survives_when_unchecked(notifier):
     assert "stock image" in msg
 
 
+def test_thumbnail_only_photos(notifier):
+    msg = _hot(notifier, {"photo_type": "uncertain"}, image_status="photos_too_small", text_reviewed=True)
+    assert "thumbnail-sized" in msg
+
+
 def test_no_photo(notifier):
     msg = _hot(notifier, {"photo_type": "uncertain"}, image_status="no_photo", text_reviewed=True)
     assert "no photo" in msg

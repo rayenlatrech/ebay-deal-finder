@@ -83,6 +83,24 @@ def image_assessment_reusable(assessment: Optional[dict]) -> bool:
 
 
 # Fields belonging to the photo verdict within a stored (merged) assessment.
+# Returned by _download_image for a thumbnail-sized photo.
+TOO_SMALL = object()
+
+
+def _today() -> str:
+    """Today's date for prompts — models otherwise judge new products by their
+    training cutoff (Gemini called the iPhone 16 Pro Max "a model that does not
+    exist", Gemma called a 2-year-old one impossibly old)."""
+    return datetime.now(timezone.utc).strftime("%d %B %Y")
+
+
+# Shared prompt rule: the model's product knowledge ends before today.
+DATE_RULE = (
+    "Today's date is {today}. Your knowledge of products ends before that: a model "
+    "you don't recognise (a newer iPhone, Galaxy, etc.) is real. Never call a model "
+    "non-existent, or a stated age or purchase date impossible, from your own knowledge."
+)
+
 _EBAY_IMAGE_SIZE_RE = re.compile(r"(i\.ebayimg\.com/.+/s-l)\d+(\.\w+)$")
 
 
@@ -94,7 +112,7 @@ def _ebay_image_size(url: str, size: int) -> str:
 IMAGE_ASSESSMENT_KEYS = frozenset({
     "photo_type", "photo_confidence", "photo_signals", "visible_damage",
     "condition_matches_description", "estimated_condition", "concerns",
-    "confidence", "image_analyzed", "image_ai_failed", "photos_reviewed",
+    "confidence", "image_analyzed", "image_ai_failed", "photos_reviewed", "photos_too_small",
 })
 
 
@@ -137,6 +155,7 @@ class AIAnalyzer:
     TEXT_ANALYSIS_PROMPT = """You are an expert at evaluating used electronics listings on eBay Italy.
 The description may be in Italian — analyze it regardless of language.
 Always respond in English.
+""" + DATE_RULE + """
 
 LISTING DATA:
 - Title: {title}
@@ -171,6 +190,7 @@ Rules:
   defect. Use an empty list when there are none."""
 
     IMAGE_ANALYSIS_PROMPT = """You are an expert at analyzing eBay product photos for used electronics.
+""" + DATE_RULE + """
 
 You are given {photo_count} photo(s) from the same listing; the first is the listing's main photo.
 
@@ -469,6 +489,7 @@ Return ONLY valid JSON (no markdown, no explanation):
             Dict with AI assessment fields (condition_assessment, red_flags, etc.)
         """
         prompt = self.TEXT_ANALYSIS_PROMPT.format(
+            today=_today(),
             title=listing.get("title", ""),
             price=listing.get("price", 0),
             avg_price=listing.get("avg_price", "unknown"),
@@ -514,10 +535,15 @@ Return ONLY valid JSON (no markdown, no explanation):
 
     # ── Image Analysis ───────────────────────────────────────────────
 
-    # The main photo keeps more detail; extra photos are sized to fit a single
+    # The lead photo keeps more detail; the others are sized to fit a single
     # 768px tile, the cheapest size Gemini bills beyond a thumbnail.
     MAIN_PHOTO_MAX_DIM = 1024
     EXTRA_PHOTO_MAX_DIM = 768
+    # Below this on its longest side a photo is a thumbnail: nothing about the
+    # condition can be read from it (one seller uploaded only 80x80 images).
+    MIN_PHOTO_DIM = 400
+    # Photos tried before giving up, so a long gallery can't stall a scan.
+    MAX_PHOTO_ATTEMPTS = 8
 
     def analyze_image(
         self,
@@ -525,37 +551,49 @@ Return ONLY valid JSON (no markdown, no explanation):
         condition: str = "",
         description_excerpt: str = "",
         extra_image_urls: Sequence[str] = (),
+        max_photos: int = 3,
     ) -> dict[str, Any]:
         """Analyze a listing's photos for stock photo detection and condition.
 
         The main photo is often the front only (or a catalog shot); the next
         photos usually show the back and edges, where damage actually shows.
-        All photos go in one request, so extras don't cost extra requests.
+        Photos are taken in gallery order, skipping thumbnails, until
+        `max_photos` usable ones are found; they all go in ONE request, so
+        extras don't cost extra requests.
 
         Args:
             image_url: URL of the listing's main image
             condition: Seller-stated condition
             description_excerpt: Brief excerpt of listing description
-            extra_image_urls: Further photos of the same listing to include
+            extra_image_urls: The listing's other photos, in gallery order
+            max_photos: Usable photos to send
 
         Returns:
             Dict with photo_type, visible_damage, condition assessment, etc.
         """
-        images = []
-        main = self._download_image(image_url, self.MAIN_PHOTO_MAX_DIM) if image_url else None
-        if main:
-            images.append(main)
-        for url in extra_image_urls:
-            if url and url != image_url:
+        candidates = [u for u in dict.fromkeys([image_url, *extra_image_urls]) if u]
+        images: list[bytes] = []
+        too_small = 0
+        for attempt, url in enumerate(candidates):
+            if len(images) >= max_photos or attempt >= self.MAX_PHOTO_ATTEMPTS:
+                break
+            if images:
                 # eBay serves every photo at 1600px; the 960px rendition is a
                 # third of the download and is shrunk to 768px regardless.
-                extra = self._download_image(_ebay_image_size(url, 960), self.EXTRA_PHOTO_MAX_DIM)
-                if extra:
-                    images.append(extra)
+                got = self._download_image(_ebay_image_size(url, 960), self.EXTRA_PHOTO_MAX_DIM)
+            else:
+                got = self._download_image(url, self.MAIN_PHOTO_MAX_DIM)
+            if got is TOO_SMALL:
+                too_small += 1
+            elif got:
+                images.append(got)
         if not images:
-            return self._default_image_analysis()
+            # Every photo a thumbnail is a finding, not an AI failure — and no
+            # request is spent on it.
+            return self._too_small_image_analysis() if too_small else self._default_image_analysis()
 
         prompt = self.IMAGE_ANALYSIS_PROMPT.format(
+            today=_today(),
             photo_count=len(images),
             condition=condition or "not specified",
             description_excerpt=description_excerpt[:500] or "no description",
@@ -575,14 +613,20 @@ Return ONLY valid JSON (no markdown, no explanation):
         parsed["photos_reviewed"] = len(images)
         return parsed
 
-    def _download_image(self, url: str, max_dim: int = MAIN_PHOTO_MAX_DIM) -> Optional[bytes]:
-        """Download an image and return it as JPEG bytes, at most `max_dim` px."""
+    def _download_image(self, url: str, max_dim: int = MAIN_PHOTO_MAX_DIM) -> Any:
+        """Download an image as JPEG bytes, at most `max_dim` px.
+
+        Returns None if it can't be fetched, and TOO_SMALL if it is a
+        thumbnail (under MIN_PHOTO_DIM), so the caller can try the next photo.
+        """
         try:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
 
             # Validate it's actually an image and resize if too large
             img = Image.open(BytesIO(resp.content))
+            if max(img.size) < self.MIN_PHOTO_DIM:
+                return TOO_SMALL
             # Resize on the longest side to save API tokens
             if max(img.size) > max_dim:
                 ratio = max_dim / max(img.size)
@@ -597,6 +641,21 @@ Return ONLY valid JSON (no markdown, no explanation):
         except Exception as e:
             logger.warning("Failed to download image %s: %s", url[:80], e)
             return None
+
+    @staticmethod
+    def _too_small_image_analysis() -> dict[str, Any]:
+        """Every photo is a thumbnail: nothing to judge, and nothing to cache."""
+        return {
+            "photos_too_small": True,
+            "photo_type": "uncertain",
+            "photo_confidence": 0.0,
+            "photo_signals": [],
+            "visible_damage": [],
+            "condition_matches_description": None,
+            "estimated_condition": "cannot_assess",
+            "concerns": ["All photos are thumbnail-sized"],
+            "confidence": 0.0,
+        }
 
     def _default_image_analysis(self) -> dict[str, Any]:
         """Return default image analysis when unavailable (never reused from cache)."""
