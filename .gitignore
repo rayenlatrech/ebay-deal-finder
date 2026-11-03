@@ -13,6 +13,9 @@ __pycache__/
 venv/
 env/
 
+# Left by a scan for the next one
+.scan_state/
+
 # Database
 *.db
 *.sqlite

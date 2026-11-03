@@ -315,13 +315,19 @@ class MarketWindow:
         """Build the window from settings.yaml; None if the data can't be read."""
         from datetime import datetime, timedelta, timezone
 
+        days = int((settings.get("baseline", {}) or {}).get("window_days", 14))
+        rows = db.get_tracked_since((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
+        if not rows:
+            return None
+        return cls.from_rows(rows, db.get_reference_prices(), settings, home)
+
+    @classmethod
+    def from_rows(cls, rows: list[dict], references: dict[str, dict], settings: dict, home: str) -> "MarketWindow":
+        """Build the window from tracked rows already in hand."""
         base_cfg = settings.get("baseline", {}) or {}
         ref_cfg = settings.get("reference", {}) or {}
         days = int(base_cfg.get("window_days", 14))
         min_listings = int(base_cfg.get("min_listings", 8))
-        rows = db.get_tracked_since((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
-        if not rows:
-            return None
         prices, ratios = compute_window_prices(
             rows, home=home,
             topup_markets=base_cfg.get("topup_marketplaces", []),
@@ -332,7 +338,7 @@ class MarketWindow:
         return cls(
             prices=prices,
             premiums=learn_storage_premiums(prices, min_listings),
-            references=db.get_reference_prices(),
+            references=references,
             ratios=ratios,
             rows=rows,
             days=days,

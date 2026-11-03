@@ -11,7 +11,7 @@ import html
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Optional
 
 import requests
 
@@ -486,19 +486,39 @@ class TelegramNotifier:
         if errors > 0:
             lines.append(f"❌ Errors: {errors}")
 
-        # Standing cross-border price gaps — worth knowing even on a quiet scan.
-        gaps = stats.get("arbitrage") or []
-        if gaps:
-            lines.extend(["", "💱 <b>Cross-border price gaps</b>"])
-            for g in gaps:
-                flag = self._flag(g["cheapest_market"])
-                lines.append(
-                    f"  {self._esc(g['product_key'])} ({self._esc(g['condition_band'])}): "
-                    f"{flag} €{g['cheapest_price']:.0f} vs €{g['home_price']:.0f} home "
-                    f"— <b>{g['gap_pct']:.0f}% cheaper</b>"
-                )
+        lines.extend(self._gap_lines(stats.get("arbitrage")))
+        return self._send_message("\n".join(lines))
 
-        lines.append("\n⏰ Next scan in ~4 hours")
+    def _gap_lines(self, gaps: Optional[list[dict]]) -> list[str]:
+        """Standing cross-border price gaps — worth knowing even on a quiet scan."""
+        if not gaps:
+            return []
+        lines = ["", "💱 <b>Cross-border price gaps</b>"]
+        for g in gaps:
+            flag = self._flag(g["cheapest_market"])
+            lines.append(
+                f"  {self._esc(g['product_key'])} ({self._esc(g['condition_band'])}): "
+                f"{flag} €{g['cheapest_price']:.0f} vs €{g['home_price']:.0f} home "
+                f"— <b>{g['gap_pct']:.0f}% cheaper</b>"
+            )
+        return lines
+
+    def send_daily_report(self, report: dict[str, Any], gaps: Optional[list[dict]] = None) -> bool:
+        """Send the running totals since the last report."""
+        scans = report.get("scans", 0)
+        per_scan = report.get("total_scanned", 0) / scans if scans else 0
+        lines = [
+            "📋 <b>Daily scan report</b>",
+            "",
+            f"🔁 Scans: {scans}",
+            f"🔍 Listings per scan: ~{per_scan:,.0f}",
+            f"🔥 Hot deals: {report.get('hot_deals', 0)}",
+            f"👍 Good deals: {report.get('good_deals', 0)}",
+            f"📸 Photo checks: {report.get('photo_checks', 0)}",
+        ]
+        if report.get("errors"):
+            lines.append(f"❌ Errors: {report['errors']}")
+        lines.extend(self._gap_lines(gaps))
         return self._send_message("\n".join(lines))
 
     # ── Error Alert ──────────────────────────────────────────────────

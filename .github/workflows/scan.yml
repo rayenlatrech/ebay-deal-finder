@@ -6,12 +6,11 @@ on:
   pull_request:
   schedule:
     # BACKUP only. Scans are started on time by an external cron (cron-job.org
-    # calling workflow_dispatch at 00, 04, 08, 12, 16, 20 UTC), because GitHub's
-    # own cron fires late and drops slots under load. This runs 30 min after
-    # each slot and skips itself if a scan ran in the last 4h — a full interval,
-    # because it has fired as much as 3.5h late (19:56 for the 16:30 slot) and
-    # a shorter look-back let it double up with the next on-time scan.
-    - cron: '30 */4 * * *'
+    # calling workflow_dispatch every hour), because GitHub's own cron fires late
+    # and drops slots under load. This skips itself if a scan started in the
+    # last 65 minutes, so it only scans when the external cron has stopped — and
+    # then every 2h, because it has fired as much as 3.5h late.
+    - cron: '30 */2 * * *'
   workflow_dispatch:
     # The external cron's trigger, and manual runs from the Actions UI
 
@@ -60,13 +59,23 @@ jobs:
             --jq "[.[] | select(.databaseId != ${{ github.run_id }})
                        | select(.event == \"schedule\" or .event == \"workflow_dispatch\")
                        | select(.conclusion != \"cancelled\")
-                       | select((now - (.createdAt | fromdateiso8601)) < 14400)] | length")
-          echo "Scans started in the last 4h: $recent"
+                       | select((now - (.createdAt | fromdateiso8601)) < 3900)] | length")
+          echo "Scans started in the last 65 min: $recent"
           if [ "$recent" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
 
       - name: Checkout code
         if: steps.guard.outputs.skip != 'true'
         uses: actions/checkout@v4
+
+      # What the last scan left for this one (market prices, verdicts). If it's
+      # missing, this simply becomes a full scan.
+      - name: Restore scan state
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .scan_state
+          key: scan-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: scan-state-
 
       - name: Set up Python
         if: steps.guard.outputs.skip != 'true'
@@ -94,6 +103,13 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           EBAY_MARKETPLACE: EBAY_IT
         run: python -m src.main
+
+      - name: Save scan state
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .scan_state
+          key: scan-state-${{ github.run_id }}-${{ github.run_attempt }}
 
   keepalive:
     # GitHub disables cron workflows in public repos after 60 days without

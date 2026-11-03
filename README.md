@@ -1,6 +1,6 @@
 # 🔍 eBay AI Deal Finder
 
-An AI-powered bot that scans **eBay Italy** every 4 hours for underpriced used electronics, builds a robust market baseline for each product, and only spends AI tokens on the listings that look genuinely cheap — then alerts you on Telegram. **Total running cost: $0.**
+An AI-powered bot that scans **eBay Italy** every hour for underpriced used electronics, builds a robust market baseline for each product, and only spends AI tokens on the listings that look genuinely cheap — then alerts you on Telegram. **Total running cost: $0.**
 
 ## ✨ Features
 
@@ -12,14 +12,14 @@ An AI-powered bot that scans **eBay Italy** every 4 hours for underpriced used e
 - 🤝 **Make Offer detection** — flags negotiable listings with Best Offer available
 - 📱 **Telegram alerts** — instant hot-deal notifications + batched good-deal summaries (HTML-formatted, so messy titles never break a message)
 - 💬 **Deal-check bot** — message the bot a device, condition and price (or an eBay link) and get a verdict against the market, the most to pay, and an AI review
-- ⏰ **Automated via GitHub Actions** — started every 4 hours on the dot by an external cron; tests run on every push
+- ⏰ **Automated via GitHub Actions** — started every hour on the dot by an external cron, with a full refresh every 4 hours; tests run on every push
 - 🔑 **Multi API key rotation** — supports multiple Gemini keys with DB-backed cooldown tracking
 - 🆓 **100% free** — all services used within their free tiers
 
 ## 🏗️ Architecture
 
 ```
-GitHub Actions (cron every 4h)
+GitHub Actions (hourly)
   → Search eBay Italy via Browse API (newest listings per category)
   → Build a robust market baseline per product bucket   ← see "How the baseline stays clean"
   → Filter: keep only listings ≥15% below their bucket baseline
@@ -207,7 +207,7 @@ python -m src.main
 
 GitHub's own cron is best-effort: scans start up to ~1.5 h late and some slots
 are dropped. A free external cron starts them on time instead; GitHub's
-schedule stays as a backup that skips itself when a scan already ran.
+schedule stays as a backup that skips itself when a scan ran in the last 65 minutes.
 
 1. **GitHub token** — Settings → Developer settings → Personal access tokens →
    *Fine-grained tokens* → Generate. Repository access: *Only select
@@ -215,7 +215,7 @@ schedule stays as a backup that skips itself when a scan already ran.
    (nothing else). Set a reminder for its expiry date.
 2. **cron-job.org** (free account) → *Create cronjob*:
    - URL: `https://api.github.com/repos/<you>/<repo>/actions/workflows/scan.yml/dispatches`
-   - Schedule: every day, hours `0,4,8,12,16,20`, minute `0`, time zone **UTC**
+   - Schedule: every hour, minute `0`, time zone **UTC**
    - Advanced → Request method **POST**, request body `{"ref":"main"}`, headers:
      `Accept: application/vnd.github+json`, `Authorization: Bearer <token>`,
      `X-GitHub-Api-Version: 2022-11-28`
@@ -244,7 +244,7 @@ webhook secret are accepted.
 ## 📁 Project Structure
 
 ```
-├── .github/workflows/scan.yml   # CI: tests on push, scan every 4h (external cron + backup)
+├── .github/workflows/scan.yml   # CI: tests on push, hourly scan (external cron + backup)
 ├── api/telegram.py              # Vercel webhook: the deal-check bot
 ├── scripts/                     # One-off setup helpers (Telegram webhook)
 ├── src/
@@ -286,14 +286,14 @@ classifier is and how much support a bucket needs before its baseline is trusted
 
 | Service | Free Tier | Your Usage | Role |
 |---------|-----------|-----------|------|
-| eBay Browse API | 5,000/day | ~280/day | Search + item details |
+| eBay Browse API | 5,000/day | ~2,700/day | Search + item details |
 | Groq | 14,400/day | ~200/day | **Primary** text/description analysis |
-| Google Gemini (×2 keys) | 3,000/day | ~80/day | Image/condition verification |
-| GitHub Actions | Unlimited (public repo) | ~1,800 min/mo | Scans + tests |
+| Google Gemini (×2 keys) | ~40/day | Up to 40/day (3 per scan) | Image/condition verification |
+| GitHub Actions | Unlimited (public repo) | ~3,000 min/mo | Scans + tests |
 | Supabase | 500 MB | < 50 MB | Listings, analyses, price history |
 | Telegram | Unlimited | ~20 msgs/day | Alerts |
 | Vercel (Hobby) | 300 s/function | a few calls/day | Deal-check bot webhook |
-| cron-job.org | Free | 6 calls/day | On-time scan triggers |
+| cron-job.org | Free | 24 calls/day | On-time scan triggers |
 
 ## 📄 License
 

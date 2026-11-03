@@ -107,13 +107,17 @@ def run_pipeline() -> None:
 
     Flow:
         1. Search eBay for all configured categories
-        2. Update market price history
+        2. Get market prices
         3. Score each listing on price
         4. For listings above threshold: run AI text analysis
         5. For top listings: run image analysis (stock detection + condition)
         6. Calculate composite scores
         7. Send alerts for hot and good deals
         8. Report scan statistics
+
+    Every few hours this is a full scan. In between, a quick scan reuses the
+    last full scan's market prices, only reviews listings the AI hasn't judged
+    at their current price, and skips resale tracking maintenance.
     """
     from src.db import Database
     from src.ebay_client import EbayClient
@@ -126,6 +130,10 @@ def run_pipeline() -> None:
         PRICED_BANDS,
     )
     from src.baseline import MarketWindow
+    from src.scan_state import (
+        add_to_report, full_scan_due, load_state, prune_judged, record_verdict,
+        restore_report, save_state, select_for_review, slim_window_rows, take_report_if_due,
+    )
     from src.sold_tracker import SoldTracker
     from src.telegram_notifier import TelegramNotifier
 
@@ -154,7 +162,17 @@ def run_pipeline() -> None:
         "logged": 0,
         "skipped": 0,
         "errors": 0,
+        "photo_checks": 0,
     }
+
+    scan_started = datetime.now(timezone.utc)
+    state = load_state()
+    judged = prune_judged(state.get("judged", {}), scan_started)
+    use_window_mode = (settings.get("baseline", {}) or {}).get("mode", "legacy") == "window"
+    full_scan = not use_window_mode or full_scan_due(
+        state, scan_started, settings["scanning"].get("full_scan_every_hours", 4)
+    )
+    logger.info("Scan type: %s", "full" if full_scan else "quick")
 
     try:
         # ── Step 1: Search eBay ──────────────────────────────────────
@@ -284,9 +302,37 @@ def run_pipeline() -> None:
         except Exception as e:
             logger.error("Sighting recording failed: %s", e)
 
-        # ── Step 2: Update Market Prices ─────────────────────────────
-        logger.info("Step 2: Updating market price history...")
-        market_prices = price_tracker.update_market_prices(listings)
+        # ── Step 2: Market Prices ────────────────────────────────────
+        # Prices every model from all listings tracked over the last N days
+        # (settings.yaml → baseline.mode: window); see baseline.py. They barely
+        # move in an hour, so a quick scan reuses the last full scan's listings.
+        logger.info("Step 2: Getting market prices...")
+        reference_prices = db.get_reference_prices()
+        window = None
+        if use_window_mode:
+            if full_scan:
+                window = MarketWindow.load(db, settings, price_tracker.marketplace_home)
+                if window:
+                    state["window_rows"] = slim_window_rows(window.rows)
+                    state["last_full_at"] = scan_started.isoformat()
+            else:
+                window = MarketWindow.from_rows(
+                    state["window_rows"], reference_prices, settings, price_tracker.marketplace_home
+                )
+            if window:
+                logger.info(
+                    "Market window: %d listings over %dd -> %d buckets (%d with >=%d listings); "
+                    "foreign/home price ratios %s",
+                    len(window.rows), window.days, len(window.prices),
+                    sum(1 for m in window.prices.values() if m.n >= window.min_listings),
+                    window.min_listings,
+                    {f"{m}/{b}": round(r, 3) for (m, b), r in window.ratios.items()},
+                )
+            else:
+                logger.warning("Market window unavailable — using the legacy baseline this run")
+        use_window = window is not None
+        # The per-scan price history only feeds the legacy baseline.
+        market_prices = {} if use_window else price_tracker.update_market_prices(listings)
 
         # Standing cross-border price gaps (a whole market pricing lower is a
         # more durable edge than any single cheap listing).
@@ -317,39 +363,17 @@ def run_pipeline() -> None:
 
         # Manually-curated new/street prices — used as a baseline ceiling so an
         # inflated eBay asking-median can't invent a deal (see the A57 case).
-        reference_prices = db.get_reference_prices()
         ref_cfg = settings.get("reference", {})
         band_factor = {
             "used": ref_cfg.get("used_factor", 0.75),
             "new": ref_cfg.get("new_factor", 1.00),
         }
 
-        # ── Market window (settings.yaml → baseline.mode: window) ────
-        # Prices every model from all listings tracked over the last N days
-        # instead of the handful posted since the previous scan; see baseline.py.
-        window = None
-        if (settings.get("baseline", {}) or {}).get("mode", "legacy") == "window":
-            window = MarketWindow.load(db, settings, price_tracker.marketplace_home)
-            if window:
-                logger.info(
-                    "Market window: %d listings over %dd -> %d buckets (%d with >=%d listings); "
-                    "foreign/home price ratios %s",
-                    len(window.rows), window.days, len(window.prices),
-                    sum(1 for m in window.prices.values() if m.n >= window.min_listings),
-                    window.min_listings,
-                    {f"{m}/{b}": round(r, 3) for (m, b), r in window.ratios.items()},
-                )
-            else:
-                logger.warning("Market window unavailable — using the legacy baseline this run")
-        use_window = window is not None
-
-        # Listings already alerted on, fetched once instead of per-listing.
-        alerted_ids = db.get_alerted_ids([l["item_id"] for l in listings])
-
-        auction_window_h = ebay_cfg.get("auction_ending_within_hours", 10)
+        auction_window_h = ebay_cfg.get("auction_ending_within_hours", 2)
         now_utc = datetime.now(timezone.utc)
 
         candidates = []
+        below_threshold = []
         for listing in listings:
             # An auction is only judgeable near its close — before that the bid
             # will keep moving, so a "cheap" auction means nothing yet.
@@ -437,12 +461,7 @@ def run_pipeline() -> None:
             )
 
             if discount_pct < cat_min_discount:
-                db.upsert_listing(listing)
-                stats["skipped"] += 1
-                continue
-
-            # Skip if already alerted
-            if listing["item_id"] in alerted_ids:
+                below_threshold.append(listing)
                 stats["skipped"] += 1
                 continue
 
@@ -463,6 +482,7 @@ def run_pipeline() -> None:
                 "max_bid": max_bid,
                 "band": band,
                 "listing": listing,
+                "total_price": float(total_price),
                 "product_key": product_key,
                 "avg_price": baseline,          # effective baseline used for scoring
                 "ebay_avg": avg_price,          # raw eBay asking baseline
@@ -479,25 +499,38 @@ def run_pipeline() -> None:
                 "rank_score": price_score * priority,
             })
 
+        db.upsert_listings(below_threshold)
+
+        # Skip listings already alerted on.
+        alerted_ids = db.get_alerted_ids([c["listing"]["item_id"] for c in candidates])
+        stats["skipped"] += sum(1 for c in candidates if c["listing"]["item_id"] in alerted_ids)
+        candidates = [c for c in candidates if c["listing"]["item_id"] not in alerted_ids]
+
         # Allocate the limited AI budget to the highest-priority strong deals.
         candidates.sort(key=lambda x: x["rank_score"], reverse=True)
-        candidates = candidates[:max_ai_analyses]
-        logger.info(
-            "Step 3 complete: %d candidates for AI analysis (out of %d)",
-            len(candidates), stats["total_scanned"],
+        max_image_analyses = settings["ai"].get("max_image_analyses_per_run", 3)
+        reviewing = select_for_review(
+            candidates, judged, full_scan, max_ai_analyses,
+            photo_slots=max_image_analyses if ai.gemini_keys else 0,
         )
+        stats["skipped"] += len(candidates) - len(reviewing)
+        logger.info(
+            "Step 3 complete: reviewing %d of %d candidates (out of %d listings)",
+            len(reviewing), len(candidates), stats["total_scanned"],
+        )
+        candidates = reviewing
 
         # ── Step 4: AI Text Analysis ─────────────────────────────────
         logger.info("Step 4: Running AI text analysis...")
         hot_deals: list[dict] = []
         good_deals: list[dict] = []
-        max_image_analyses = settings["ai"].get("max_image_analyses_per_run", 20)
         photos_per_check = settings["ai"].get("photos_per_check", 3)
         image_analyses_done = 0
+        image_analyses_failed = 0
 
         # A listing's description and photos never change, so reuse any recent
         # assessment instead of paying for the same answer every scan.
-        cache_hours = settings["ai"].get("cache_hours", 72)
+        cache_hours = settings["ai"].get("cache_hours", 720)
         cache_since = (datetime.now(timezone.utc) - timedelta(hours=cache_hours)).isoformat()
         analysis_cache = db.get_recent_analyses(
             [c["listing"]["item_id"] for c in candidates], cache_since
@@ -511,6 +544,10 @@ def run_pipeline() -> None:
         image_statuses: dict[str, int] = {}
         score_debug: list[dict] = []
 
+        # Text reviews come first, because photo checks are scarce: the few
+        # allowed per scan should go to the listings most likely to be hot deals,
+        # and that can't be known until the text is reviewed.
+        reviewed: list[dict] = []
         for candidate in candidates:
             listing = candidate["listing"]
             cached_text, cached_image = split_assessment(analysis_cache.get(listing["item_id"]))
@@ -547,11 +584,13 @@ def run_pipeline() -> None:
                 if not text_analysis.get("is_complete_item", True):
                     logger.info("Skipping %s: Groq flagged as incomplete/accessory", listing["item_id"])
                     stats["skipped"] += 1
+                    record_verdict(judged, candidate, now_utc)
                     continue
-                
+
                 if text_analysis.get("condition_assessment") in ["parts_only", "damaged"]:
                     logger.info("Skipping %s: Groq flagged as damaged/parts", listing["item_id"])
                     stats["skipped"] += 1
+                    record_verdict(judged, candidate, now_utc)
                     continue
 
                 # Calculate seller score
@@ -573,12 +612,10 @@ def run_pipeline() -> None:
                 # Calculate listing quality
                 listing_quality = scorer.calculate_listing_quality_score(listing)
 
-                # ── Step 5: Image Analysis (Top Listings Only) ───────
-                image_score = 50  # Default neutral
-                photo_type = "uncertain"
-                stock_penalty = 0
-                image_analysis = {}
-                image_status = "no_photo"
+                # An item first listed weeks ago and still unsold usually has a
+                # catch, even when a relist makes it look brand new.
+                age_days, relisted = listing_age(listing, now_utc)
+                age_penalty = scorer.calculate_age_penalty(age_days)
 
                 # Image checks are capped per run, so don't spend one on a
                 # listing that can't alert even with the best possible photo
@@ -593,8 +630,50 @@ def run_pipeline() -> None:
                     listing_quality_score=listing_quality,
                     is_suspicious=candidate["is_suspicious"],
                     ai_penalty=scorer.calculate_ai_penalty(text_analysis, {}),
+                    age_penalty=age_penalty,
                 )
-                could_alert = scorer.classify_deal(best_case) in ("hot_deal", "good_deal")
+
+                reviewed.append({
+                    **candidate,
+                    "text_analysis": text_analysis,
+                    "cached_image": cached_image,
+                    "fresh_text": not cached_text,
+                    "seller_score": seller_score,
+                    "seller_trust_level": seller_trust_level,
+                    "condition_score": condition_score,
+                    "listing_quality": listing_quality,
+                    "age_days": age_days,
+                    "relisted": relisted,
+                    "age_penalty": age_penalty,
+                    "best_case": best_case,
+                })
+
+            except Exception as e:
+                logger.error("Error analyzing %s: %s", listing.get("item_id", "?"), e)
+                stats["errors"] += 1
+
+        reviewed.sort(key=lambda c: c["best_case"], reverse=True)
+
+        for candidate in reviewed:
+            listing = candidate["listing"]
+            text_analysis = candidate["text_analysis"]
+            cached_image = candidate["cached_image"]
+            seller_score = candidate["seller_score"]
+            seller_trust_level = candidate["seller_trust_level"]
+            condition_score = candidate["condition_score"]
+            listing_quality = candidate["listing_quality"]
+            age_days = candidate["age_days"]
+            relisted = candidate["relisted"]
+            age_penalty = candidate["age_penalty"]
+            could_alert = scorer.classify_deal(candidate["best_case"]) in ("hot_deal", "good_deal")
+            try:
+                # ── Step 5: Image Analysis (Top Listings Only) ───────
+                image_score = 50  # Default neutral
+                photo_type = "uncertain"
+                stock_penalty = 0
+                image_analysis = {}
+                image_status = "no_photo"
+                fresh_image = False
 
                 # Quick free check first
                 quick_check = ai.quick_photo_check(listing)
@@ -627,8 +706,14 @@ def run_pipeline() -> None:
                         photo_type, cached_image.get("condition_matches_description")
                     )
 
-                # Full image analysis for top candidates
-                elif image_url and could_alert and image_analyses_done < max_image_analyses:
+                # Full image analysis for top candidates. Only a completed check
+                # uses up the allowance: a brief Gemini outage shouldn't cost this
+                # scan's few checks. It stops after as many failures, and when
+                # the daily limit has taken every key out.
+                elif (image_url and could_alert and ai.gemini_keys
+                      and image_analyses_done < max_image_analyses
+                      and image_analyses_failed < max_image_analyses):
+                    fresh_image = True
                     image_analysis = ai.analyze_image(
                         image_url,
                         condition=listing.get("condition", ""),
@@ -641,9 +726,12 @@ def run_pipeline() -> None:
                     )
                     if image_analysis.get("photos_too_small"):
                         image_status = "photos_too_small"   # no request was spent
+                    elif image_analysis.get("image_ai_failed"):
+                        image_analyses_failed += 1
+                        image_status = "ai_failed"
                     else:
                         image_analyses_done += 1
-                        image_status = "ai_failed" if image_analysis.get("image_ai_failed") else "checked"
+                        image_status = "checked"
 
                     photo_type = image_analysis.get("photo_type", "uncertain")
                     image_score = _image_score_for(
@@ -667,10 +755,6 @@ def run_pipeline() -> None:
                 # The model's own findings (red flags, undisclosed defects,
                 # visible damage, its deal verdict) now count against the score.
                 ai_penalty = scorer.calculate_ai_penalty(text_analysis, image_analysis)
-                # An item first listed weeks ago and still unsold usually has a
-                # catch, even when a relist makes it look brand new.
-                age_days, relisted = listing_age(listing, now_utc)
-                age_penalty = scorer.calculate_age_penalty(age_days)
 
                 deal_score = scorer.calculate_composite_score(
                     price_score=candidate["price_score"],
@@ -738,17 +822,26 @@ def run_pipeline() -> None:
                     "relisted": relisted,
                 }
 
-                # Save to database
+                # Save to database. A new row only when there's something new to
+                # keep: one per re-score would pile up rows that say the same thing.
                 db.upsert_listing(listing)
-                db.save_analysis({
-                    "listing_id": listing["item_id"],
-                    "deal_score": deal_score,
-                    "price_score": candidate["price_score"],
-                    "condition_score": condition_score,
-                    "seller_score": seller_score,
-                    "image_score": image_score,
-                    "ai_assessment": full_analysis,
-                })
+                if candidate["fresh_text"] or fresh_image or deal_class in ("hot_deal", "good_deal"):
+                    db.save_analysis({
+                        "listing_id": listing["item_id"],
+                        "deal_score": deal_score,
+                        "price_score": candidate["price_score"],
+                        "condition_score": condition_score,
+                        "seller_score": seller_score,
+                        "image_score": image_score,
+                        "ai_assessment": full_analysis,
+                    })
+
+                # A failed text review stays unjudged so the next scan retries it.
+                if not text_analysis.get("text_ai_failed"):
+                    record_verdict(
+                        judged, candidate, now_utc,
+                        needs_photo=could_alert and image_status in ("skipped_limit", "ai_failed"),
+                    )
 
                 # ── Step 7: Send Alerts ──────────────────────────────
                 if deal_class == "hot_deal":
@@ -799,12 +892,13 @@ def run_pipeline() -> None:
             else:
                 logger.warning("Deal summary failed to send — not marking as alerted")
 
+        stats["photo_checks"] = image_analyses_done
         if candidates:
             logger.info(
                 "AI cache: text reused %d/%d (%d fresh calls), photo verdict reused %d, "
-                "fresh image checks %d",
+                "fresh image checks %d (%d failed)",
                 cache_hits, len(candidates), len(candidates) - cache_hits,
-                image_cache_hits, image_analyses_done,
+                image_cache_hits, image_analyses_done, image_analyses_failed,
             )
             logger.info("Photo review: %s", ", ".join(
                 f"{k}={v}" for k, v in sorted(image_statuses.items())) or "none")
@@ -840,17 +934,27 @@ def run_pipeline() -> None:
             logger.error("Seller stat recording failed: %s", e)
 
         # ── Step 9: Resale tracking maintenance (never breaks a scan) ─
-        try:
-            ended = sold_tracker.reconcile_ended(ebay)
-            sold_tracker.rebuild_resale_stats()
-            sold_tracker.cleanup()
-            logger.info("Resale maintenance: finalized %d ended listing(s)", ended)
-        except Exception as e:
-            logger.error("Resale maintenance failed: %s", e)
+        if full_scan:
+            try:
+                ended = sold_tracker.reconcile_ended(ebay)
+                sold_tracker.rebuild_resale_stats()
+                sold_tracker.cleanup()
+                logger.info("Resale maintenance: finalized %d ended listing(s)", ended)
+            except Exception as e:
+                logger.error("Resale maintenance failed: %s", e)
 
         # ── Step 8: Report ───────────────────────────────────────────
+        # Totals only, once a day: a message per scan would be 24 a day.
         if settings["telegram"].get("send_scan_report", True):
-            telegram.send_scan_report(stats)
+            add_to_report(state, stats, scan_started)
+            report = take_report_if_due(
+                state, scan_started, settings["telegram"].get("report_every_hours", 24)
+            )
+            if report and not telegram.send_daily_report(report, stats.get("arbitrage")):
+                restore_report(state, report)
+
+        state["judged"] = judged
+        save_state(state)
 
         logger.info("═══ Scan Complete ═══")
         logger.info("Stats: %s", stats)

@@ -24,8 +24,29 @@ class Database:
 
     def upsert_listing(self, listing: dict[str, Any]) -> None:
         """Insert or update a listing record."""
-        now = datetime.now(timezone.utc).isoformat()
-        record = {
+        try:
+            self.client.table("listings").upsert(
+                self._listing_record(listing), on_conflict="id"
+            ).execute()
+        except Exception as e:
+            logger.error("Failed to upsert listing %s: %s", listing["item_id"], e)
+
+    def upsert_listings(self, listings: list[dict[str, Any]]) -> None:
+        """Batch upsert listings, instead of a round-trip per listing."""
+        # Postgres rejects an upsert that touches the same row twice.
+        records = list({l["item_id"]: self._listing_record(l) for l in listings}.values())
+        CHUNK = 500
+        for start in range(0, len(records), CHUNK):
+            try:
+                self.client.table("listings").upsert(
+                    records[start:start + CHUNK], on_conflict="id"
+                ).execute()
+            except Exception as e:
+                logger.error("Failed to upsert %d listings: %s", len(records[start:start + CHUNK]), e)
+
+    @staticmethod
+    def _listing_record(listing: dict[str, Any]) -> dict[str, Any]:
+        return {
             "id": listing["item_id"],
             "title": listing["title"],
             "price": listing["price"],
@@ -38,14 +59,8 @@ class Database:
             "image_url": listing.get("image_url"),
             "listing_url": listing.get("item_url"),
             "marketplace": listing.get("marketplace", "EBAY_IT"),
-            "last_seen_at": now,
+            "last_seen_at": datetime.now(timezone.utc).isoformat(),
         }
-        try:
-            self.client.table("listings").upsert(
-                record, on_conflict="id"
-            ).execute()
-        except Exception as e:
-            logger.error("Failed to upsert listing %s: %s", listing["item_id"], e)
 
     def get_listing(self, item_id: str) -> Optional[dict]:
         """Get a listing by eBay item ID. Returns None if not found."""
@@ -105,28 +120,26 @@ class Database:
         the same item every scan burns quota for an answer we already have.
         Listings can sit on eBay for weeks, so this is the difference between
         analysing an item once and analysing it dozens of times.
+
+        One query per listing: a listing can have many rows, and a shared query
+        stops at 1,000 rows, which would make the rest look never analysed.
         """
         out: dict[str, dict] = {}
-        unique = list({i for i in item_ids if i})
-        CHUNK = 200
-        for start in range(0, len(unique), CHUNK):
-            chunk = unique[start:start + CHUNK]
+        for item_id in {i for i in item_ids if i}:
             try:
                 resp = (
                     self.client.table("analyses")
-                    .select("listing_id, ai_assessment, analyzed_at")
-                    .in_("listing_id", chunk)
+                    .select("ai_assessment")
+                    .eq("listing_id", item_id)
                     .gte("analyzed_at", since_iso)
                     .order("analyzed_at", desc=True)
+                    .limit(1)
                     .execute()
                 )
-                for row in (resp.data or []):
-                    # Ordered newest-first, so keep the first hit per listing.
-                    lid = row["listing_id"]
-                    if lid not in out and row.get("ai_assessment"):
-                        out[lid] = row["ai_assessment"]
+                if resp.data and resp.data[0].get("ai_assessment"):
+                    out[item_id] = resp.data[0]["ai_assessment"]
             except Exception as e:
-                logger.error("Failed to load cached analyses: %s", e)
+                logger.error("Failed to load cached analysis for %s: %s", item_id, e)
         return out
 
     def get_alerted_ids(self, item_ids: list[str]) -> set[str]:
