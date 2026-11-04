@@ -132,6 +132,9 @@ baseline:
 
 telegram:
   batch_good_deals: true
+  # Hot deals and auctions alert straight away; other good deals wait for one of
+  # these (UTC, so 08:00, 13:00 and 19:00 in Italy in winter). Empty = every scan.
+  digest_hours_utc: [7, 12, 18]
   send_scan_report: true
   report_every_hours: 24
 
@@ -140,6 +143,8 @@ tracking:
   enabled: true
   stale_hours: 24            # re-check a listing only after this long unseen
   max_reconcile_checks: 120  # cap getItem liveness checks per run (quota guard)
+  alert_watch_days: 7        # re-check alerted listings first for this long...
+  max_alert_checks: 100      # ...using at most this many checks per full scan
   max_track_days: 90         # stop tracking a listing after this long
   sold_max_days: 60          # ended within this window => proxy "sold"
   retention_days: 150        # keep raw sold_comps this long, then roll up + drop

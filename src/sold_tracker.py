@@ -28,6 +28,12 @@ from src.price_tracker import (
 logger = logging.getLogger(__name__)
 
 
+# How often an alerted listing is re-checked: while it's new, and after a day.
+# A full scan runs every 4h, so 3.5h means every one of them.
+FRESH_ALERT_RECHECK_HOURS = 3.5
+OLD_ALERT_RECHECK_HOURS = 20
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -52,6 +58,8 @@ class SoldTracker:
         self.retention_days = cfg.get("retention_days", 150)
         self.min_comps = cfg.get("min_comps", 3)
         self.stats_refresh_hours = cfg.get("stats_refresh_hours", 20)
+        self.alert_watch_days = cfg.get("alert_watch_days", 7)
+        self.max_alert_checks = cfg.get("max_alert_checks", 100)
 
     # ── Step A: record what we saw this scan ──────────────────────────
 
@@ -144,28 +152,83 @@ class SoldTracker:
         stale_before = (now - timedelta(hours=self.stale_hours)).isoformat()
         rows = self.db.get_stale_tracked(stale_before, self.max_reconcile_checks)
 
-        finalized = 0
-        for row in rows:
-            age_days = (now - _parse(row["first_seen"])).days
-            # Check against the listing's own marketplace, otherwise a live
-            # foreign item 404s on the home site and is recorded as sold.
-            active = ebay.item_is_active(row["id"], marketplace=row.get("marketplace"))
+        return sum(self._check_row(ebay, row, now) for row in rows)
 
-            # Still active and not too old: reset its clock, keep tracking.
-            if active is True and age_days < self.max_track_days:
+    def _check_row(self, ebay, row: dict, now: datetime, keep_in_window: bool = True) -> bool:
+        """Re-check one tracked listing. Returns True if it was finalized.
+
+        Touching a live row puts it back in the market window, so a re-check that
+        exists only to time an alert passes keep_in_window=False.
+        """
+        age_days = (now - _parse(row["first_seen"])).days
+        # Check against the listing's own marketplace, otherwise a live
+        # foreign item 404s on the home site and is recorded as sold.
+        active = ebay.item_is_active(row["id"], marketplace=row.get("marketplace"))
+
+        # Still active and not too old: reset its clock, keep tracking.
+        if active is True and age_days < self.max_track_days:
+            if keep_in_window:
                 self.db.touch_tracked(row["id"], now.isoformat())
-                continue
-            # Transient/unknown and not too old: advance check cursor, retry later.
-            if active is None and age_days < self.max_track_days:
+            else:
                 self.db.update_tracked_checked(row["id"], now.isoformat())
-                continue
+            return False
+        # Transient/unknown and not too old: advance check cursor, retry later.
+        if active is None and age_days < self.max_track_days:
+            self.db.update_tracked_checked(row["id"], now.isoformat())
+            return False
 
-            # Ended (404) or exceeded the tracking horizon -> finalize.
-            comp = self.build_comp(row, ended_via_404=(active is False), sold_max_days=self.sold_max_days)
-            self.db.finalize_tracked(row["id"], comp)
-            finalized += 1
+        # Ended (404) or exceeded the tracking horizon -> finalize.
+        comp = self.build_comp(row, ended_via_404=(active is False), sold_max_days=self.sold_max_days)
+        self.db.finalize_tracked(row["id"], comp)
+        return True
 
-        return finalized
+    def reconcile_alerted(self, ebay) -> int:
+        """Re-check recently alerted listings ahead of the general backlog.
+
+        The backlog takes weeks to get through, so this is what shows how fast
+        deals really go. New alerts are checked every full scan for a day, then
+        daily for the rest of the watch. Seeing a listing in search results
+        counts as a check, so those cost nothing.
+        """
+        if not self.enabled:
+            return 0
+
+        now = _now()
+        alerted = self.db.get_alerted_since((now - timedelta(days=self.alert_watch_days)).isoformat())
+        rows = self.db.get_tracked_rows(list(alerted))
+
+        def is_due(row: dict) -> bool:
+            alert_age = (now - _parse(alerted[row["id"]]["analyzed_at"])).total_seconds() / 3600
+            checked_ago = (now - _parse(row["last_checked"])).total_seconds() / 3600
+            return checked_ago >= (FRESH_ALERT_RECHECK_HOURS if alert_age < 24 else OLD_ALERT_RECHECK_HOURS)
+
+        due = sorted((r for r in rows if is_due(r)),
+                     key=lambda r: alerted[r["id"]]["analyzed_at"], reverse=True)
+        return sum(self._check_row(ebay, row, now, keep_in_window=False) for row in due[: self.max_alert_checks])
+
+    def alert_outcomes(self) -> Optional[dict]:
+        """How fast fixed-price alerts disappeared, or None with nothing to report.
+
+        Only alerts old enough to have been watched for 3 days, and young enough
+        to still be watched. Auctions aren't tracked, and always end anyway.
+        """
+        now = _now()
+        alerted = self.db.get_alerted_since((now - timedelta(days=self.alert_watch_days)).isoformat())
+        settled = [i for i, a in alerted.items()
+                   if (now - _parse(a["analyzed_at"])).total_seconds() >= 72 * 3600]
+        ended = self.db.get_ended_times(settled)
+        still_tracked = {r["id"] for r in self.db.get_tracked_rows(settled)}
+        measured = [i for i in settled if i in ended or i in still_tracked]
+        if not measured:
+            return None
+
+        result = {"alerts": len(measured), "within_6h": 0, "within_24h": 0, "within_72h": 0}
+        for item_id, ended_at in ended.items():
+            hours = (_parse(ended_at) - _parse(alerted[item_id]["analyzed_at"])).total_seconds() / 3600
+            for limit in (6, 24, 72):
+                if hours <= limit:
+                    result[f"within_{limit}h"] += 1
+        return result
 
     # ── Step C: roll comps up into compact per-bucket stats ───────────
 

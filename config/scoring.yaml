@@ -9,7 +9,7 @@ weights:
 # Alert thresholds
 thresholds:
   hot_deal: 80
-  good_deal: 60
+  good_deal: 65
   log_only: 40
 
 # Price discount → score mapping

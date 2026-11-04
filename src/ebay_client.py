@@ -27,6 +27,11 @@ class EbayClient:
         self._access_token: Optional[str] = None
         self._token_expiry: float = 0
         self.session = requests.Session()
+        # Counted so the daily report can show use against the 5,000/day limit.
+        self.browse_calls = 0
+        # Requests eBay kept refusing: they look like "no results" otherwise.
+        self.failed_calls = 0
+        self.session.hooks["response"].append(self._count_browse_call)
         logger.info("eBay client initialized for marketplace: %s", self.marketplace)
 
     # ── Authentication ───────────────────────────────────────────────
@@ -61,6 +66,10 @@ class EbayClient:
         self._token_expiry = time.time() + token_data.get("expires_in", 7200) - 300
         logger.info("eBay OAuth token acquired, expires in %ss", token_data.get("expires_in"))
         return self._access_token
+
+    def _count_browse_call(self, response, *args, **kwargs) -> None:
+        if "/buy/browse/" in response.url:
+            self.browse_calls += 1
 
     def _get_headers(self, marketplace: Optional[str] = None) -> dict[str, str]:
         """Build request headers with auth and the target marketplace.
@@ -100,7 +109,10 @@ class EbayClient:
                     time.sleep(wait)
                 else:
                     logger.error("API call failed after %d retries: %s", max_retries, e)
+                    self.failed_calls += 1
                     raise
+        logger.error("Still rate limited after %d attempts: %s", max_retries, url)
+        self.failed_calls += 1
         return {}
 
     # ── Search ───────────────────────────────────────────────────────

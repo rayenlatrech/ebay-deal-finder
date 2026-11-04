@@ -39,6 +39,9 @@ def _image_score_for(photo_type: str, condition_matches: Optional[bool]) -> int:
 # The most a photo check can add: real photos that match the description.
 BEST_IMAGE_SCORE = _image_score_for("real", True)
 
+# A scan makes about 66 searches, so this many lost is more than a blip.
+MANY_FAILED_SEARCHES = 10
+
 # Why a listing's photo was or wasn't judged by the image model:
 #   checked / checked_earlier — the model looked at the main photo (now / cached)
 #   ai_failed            — the model was called but unavailable
@@ -124,15 +127,18 @@ def run_pipeline() -> None:
     from src.ai_analyzer import (
         AIAnalyzer, split_assessment, text_assessment_reusable, image_assessment_reusable,
     )
-    from src.deal_scorer import DealScorer, is_trusted_seller, listing_age
+    from src.deal_scorer import (
+        DealScorer, exit_signal, find_exit_mismatches, is_trusted_seller, listing_age,
+    )
     from src.price_tracker import (
         PriceTracker, is_for_parts, condition_band, baseline_key,
         PRICED_BANDS,
     )
     from src.baseline import MarketWindow
     from src.scan_state import (
-        add_to_report, full_scan_due, load_state, prune_judged, record_verdict,
-        restore_report, save_state, select_for_review, slim_window_rows, take_report_if_due,
+        add_to_report, digest_due, full_scan_due, load_state, prune_judged, record_verdict,
+        restore_report, save_state, select_for_review, slim_deal, slim_window_rows,
+        take_report_if_due,
     )
     from src.sold_tracker import SoldTracker
     from src.telegram_notifier import TelegramNotifier
@@ -168,6 +174,10 @@ def run_pipeline() -> None:
     scan_started = datetime.now(timezone.utc)
     state = load_state()
     judged = prune_judged(state.get("judged", {}), scan_started)
+    # Good deals waiting for the next digest. The first one waits for its time.
+    pending_digest = state.get("digest", {})
+    digest_hours = settings["telegram"].get("digest_hours_utc") or []
+    state.setdefault("last_digest_at", scan_started.isoformat())
     use_window_mode = (settings.get("baseline", {}) or {}).get("mode", "legacy") == "window"
     full_scan = not use_window_mode or full_scan_due(
         state, scan_started, settings["scanning"].get("full_scan_every_hours", 4)
@@ -203,6 +213,13 @@ def run_pipeline() -> None:
             listings.extend(a for a in auctions if a["item_id"] not in known)
 
         stats["total_scanned"] = len(listings)
+        # A refused search looks just like an empty one, so say when it's a lot of them.
+        stats["failed_searches"] = ebay.failed_calls
+        if ebay.failed_calls >= MANY_FAILED_SEARCHES:
+            telegram.send_error_alert(
+                f"eBay refused {ebay.failed_calls} searches, so this scan may have missed "
+                "many listings. This often means the daily limit of 5,000 calls was reached."
+            )
         logger.info("Found %d listings across all categories", len(listings))
 
         # Point every alert link at the home marketplace so it opens in the
@@ -315,6 +332,13 @@ def run_pipeline() -> None:
                 if window:
                     state["window_rows"] = slim_window_rows(window.rows)
                     state["last_full_at"] = scan_started.isoformat()
+                elif state.get("window_rows"):
+                    # A few hours old beats the legacy baseline, whose price
+                    # history stopped being written. The next scan retries.
+                    logger.warning("Market window read failed — using the last full scan's")
+                    window = MarketWindow.from_rows(
+                        state["window_rows"], reference_prices, settings, price_tracker.marketplace_home
+                    )
             else:
                 window = MarketWindow.from_rows(
                     state["window_rows"], reference_prices, settings, price_tracker.marketplace_home
@@ -524,6 +548,8 @@ def run_pipeline() -> None:
         logger.info("Step 4: Running AI text analysis...")
         hot_deals: list[dict] = []
         good_deals: list[dict] = []
+        send_now: list[dict] = []
+        resale_stats = db.get_resale_stats()
         photos_per_check = settings["ai"].get("photos_per_check", 3)
         image_analyses_done = 0
         image_analyses_failed = 0
@@ -555,6 +581,11 @@ def run_pipeline() -> None:
                 cached_text = {}
             if not image_assessment_reusable(cached_image):
                 cached_image = {}
+            # The description hasn't changed, but "not a good deal" was about the
+            # old price. Only a cut matters: a higher price stays not a deal.
+            earlier = judged.get(listing["item_id"])
+            if cached_text and earlier and candidate["total_price"] < float(earlier.get("price") or 0) - 0.005:
+                cached_text = {k: v for k, v in cached_text.items() if k != "is_good_deal"}
             try:
                 # Get full item details for description (query the listing's own
                 # marketplace — a foreign item can 404 against the home site).
@@ -820,6 +851,10 @@ def run_pipeline() -> None:
                     "text_reviewed": not text_analysis.get("text_ai_failed", False),
                     "listing_age_days": round(age_days, 2) if age_days is not None else None,
                     "relisted": relisted,
+                    **exit_signal(
+                        resale_stats.get((candidate["product_key"], candidate["band"])),
+                        candidate["avg_price"],
+                    ),
                 }
 
                 # Save to database. A new row only when there's something new to
@@ -836,12 +871,9 @@ def run_pipeline() -> None:
                         "ai_assessment": full_analysis,
                     })
 
-                # A failed text review stays unjudged so the next scan retries it.
-                if not text_analysis.get("text_ai_failed"):
-                    record_verdict(
-                        judged, candidate, now_utc,
-                        needs_photo=could_alert and image_status in ("skipped_limit", "ai_failed"),
-                    )
+                # A full scan can re-score a deal already waiting for a digest.
+                was_queued = pending_digest.pop(listing["item_id"], None) is not None
+                delivered = True
 
                 # ── Step 7: Send Alerts ──────────────────────────────
                 if deal_class == "hot_deal":
@@ -850,8 +882,11 @@ def run_pipeline() -> None:
                         listing["title"][:40], listing["price"],
                         candidate["discount_pct"], deal_score,
                     )
-                    telegram.send_hot_deal_alert(listing, full_analysis, scores)
-                    db.mark_alerted(listing["item_id"])
+                    delivered = telegram.send_hot_deal_alert(listing, full_analysis, scores)
+                    if delivered:
+                        db.mark_alerted(listing["item_id"])
+                    else:
+                        logger.warning("Hot deal alert failed to send — it stays unjudged for a retry")
                     hot_deals.append({
                         "listing": listing,
                         "analysis": full_analysis,
@@ -865,12 +900,20 @@ def run_pipeline() -> None:
                         listing["title"][:40], listing["price"],
                         candidate["discount_pct"], deal_score,
                     )
-                    good_deals.append({
-                        "listing": listing,
-                        "analysis": full_analysis,
-                        "scores": scores,
-                    })
-                    stats["good_deals"] += 1
+                    deal = {"listing": listing, "analysis": full_analysis, "scores": scores}
+                    # An auction would end before the next digest, and a deal only
+                    # short of hot for want of a photo check shouldn't wait for one.
+                    would_be_hot = (
+                        scorer.classify_deal(candidate["best_case"]) == "hot_deal"
+                        and image_status in ("skipped_limit", "ai_failed")
+                    )
+                    if listing.get("is_auction") or would_be_hot or not digest_hours:
+                        send_now.append(deal)
+                    else:
+                        pending_digest[listing["item_id"]] = slim_deal(deal)
+                    if not was_queued:
+                        good_deals.append(deal)
+                        stats["good_deals"] += 1
 
                 elif deal_class == "log_only":
                     stats["logged"] += 1
@@ -878,19 +921,45 @@ def run_pipeline() -> None:
                 else:
                     stats["skipped"] += 1
 
+                # A failed text review or alert stays unjudged so the next scan
+                # retries it.
+                if delivered and not text_analysis.get("text_ai_failed"):
+                    record_verdict(
+                        judged, candidate, now_utc,
+                        needs_photo=could_alert and image_status in ("skipped_limit", "ai_failed"),
+                    )
+
             except Exception as e:
                 logger.error("Error analyzing %s: %s", listing.get("item_id", "?"), e)
                 stats["errors"] += 1
 
         # ── Send Batched Good Deals ──────────────────────────────────
-        if good_deals and settings["telegram"].get("batch_good_deals", True):
+        batching = settings["telegram"].get("batch_good_deals", True)
+        if send_now and batching:
             # Only mark as alerted if the summary actually went out, otherwise
             # a failed send would silently bury these listings forever.
-            if telegram.send_deal_summary(good_deals):
-                for deal in good_deals:
+            if telegram.send_deal_summary(send_now):
+                for deal in send_now:
                     db.mark_alerted(deal["listing"]["item_id"])
             else:
                 logger.warning("Deal summary failed to send — not marking as alerted")
+
+        if pending_digest and batching and digest_due(state, scan_started, digest_hours):
+            # They may have waited for hours, so leave out any that have gone.
+            gone = [
+                item_id for item_id, deal in pending_digest.items()
+                if ebay.item_is_active(item_id, marketplace=deal["listing"].get("marketplace")) is False
+            ]
+            for item_id in gone:
+                del pending_digest[item_id]
+            if not pending_digest or telegram.send_deal_summary(list(pending_digest.values())):
+                for item_id in pending_digest:
+                    db.mark_alerted(item_id)
+                logger.info("Digest sent: %d deal(s), %d already gone", len(pending_digest), len(gone))
+                pending_digest.clear()
+                state["last_digest_at"] = scan_started.isoformat()
+            else:
+                logger.warning("Digest failed to send — keeping it for the next scan")
 
         stats["photo_checks"] = image_analyses_done
         if candidates:
@@ -936,7 +1005,8 @@ def run_pipeline() -> None:
         # ── Step 9: Resale tracking maintenance (never breaks a scan) ─
         if full_scan:
             try:
-                ended = sold_tracker.reconcile_ended(ebay)
+                alerted_ended = sold_tracker.reconcile_alerted(ebay)
+                ended = alerted_ended + sold_tracker.reconcile_ended(ebay)
                 sold_tracker.rebuild_resale_stats()
                 sold_tracker.cleanup()
                 logger.info("Resale maintenance: finalized %d ended listing(s)", ended)
@@ -946,14 +1016,28 @@ def run_pipeline() -> None:
         # ── Step 8: Report ───────────────────────────────────────────
         # Totals only, once a day: a message per scan would be 24 a day.
         if settings["telegram"].get("send_scan_report", True):
+            stats["ebay_calls"] = ebay.browse_calls
             add_to_report(state, stats, scan_started)
             report = take_report_if_due(
                 state, scan_started, settings["telegram"].get("report_every_hours", 24)
             )
-            if report and not telegram.send_daily_report(report, stats.get("arbitrage")):
-                restore_report(state, report)
+            if report:
+                outcomes, feedback, mismatches = None, None, None
+                try:
+                    outcomes = sold_tracker.alert_outcomes()
+                    feedback = db.get_feedback_counts()
+                    if window:
+                        mismatches = find_exit_mismatches(window.prices, resale_stats)
+                except Exception as e:     # the totals still go out
+                    logger.error("Report extras failed: %s", e)
+                if not telegram.send_daily_report(
+                    report, stats.get("arbitrage"), outcomes=outcomes,
+                    feedback=feedback, mismatches=mismatches,
+                ):
+                    restore_report(state, report)
 
         state["judged"] = judged
+        state["digest"] = pending_digest
         save_state(state)
 
         logger.info("═══ Scan Complete ═══")

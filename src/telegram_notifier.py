@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_MESSAGE_LENGTH = 4096
+# A digest stays short enough to read; the buttons also need a row per deal.
+MAX_DIGEST_ROWS = 15
+# Telegram limits a button's callback data to 64 bytes.
+MAX_CALLBACK_BYTES = 64
+FEEDBACK_BUTTONS = (("up", "👍"), ("down", "👎"), ("bought", "🛒"))
 
 
 class TelegramNotifier:
@@ -43,14 +48,35 @@ class TelegramNotifier:
         except requests.exceptions.RequestException as e:
             logger.warning("sendChatAction failed: %s", type(e).__name__)
 
-    def _send_message(self, text: str, parse_mode: str = "HTML") -> bool:
+    def answer_callback(self, callback_id: str, text: str) -> None:
+        """Clear a pressed button's spinner and show a short note (best effort)."""
+        try:
+            self.session.post(
+                TELEGRAM_API.format(token=self.token, method="answerCallbackQuery"),
+                json={"callback_query_id": callback_id, "text": text}, timeout=5,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.warning("answerCallbackQuery failed: %s", type(e).__name__)
+
+    def edit_reply_markup(self, chat_id: Any, message_id: Any, markup: dict) -> None:
+        """Replace a sent message's buttons (best effort)."""
+        try:
+            self.session.post(
+                TELEGRAM_API.format(token=self.token, method="editMessageReplyMarkup"),
+                json={"chat_id": chat_id, "message_id": message_id, "reply_markup": markup}, timeout=5,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.warning("editMessageReplyMarkup failed: %s", type(e).__name__)
+
+    def _send_message(self, text: str, parse_mode: str = "HTML", reply_markup: Optional[dict] = None) -> bool:
         """Send a message via Telegram Bot API.
 
-        Handles message splitting if text exceeds 4096 chars.
+        Handles message splitting if text exceeds 4096 chars. Buttons go on the
+        last part.
         """
         chunks = self._split_message(text)
 
-        for chunk in chunks:
+        for position, chunk in enumerate(chunks):
             url = TELEGRAM_API.format(token=self.token, method="sendMessage")
             payload = {
                 "chat_id": self.chat_id,
@@ -58,6 +84,8 @@ class TelegramNotifier:
                 "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
             }
+            if reply_markup and position == len(chunks) - 1:
+                payload["reply_markup"] = reply_markup
             try:
                 resp = self.session.post(url, json=payload, timeout=15)
                 if resp.status_code == 429:
@@ -158,6 +186,35 @@ class TelegramNotifier:
         if source == "retail estimate":
             return f"€{value:.0f} retail estimate (too few listings to price it)"
         return f"€{value:.0f} {self._esc(source)}"
+
+    # ── Exit prices ──────────────────────────────────────────────────
+
+    def _exit_lines(self, scores: dict[str, Any]) -> list[str]:
+        """What similar units left the market at, which is a proxy for a sale."""
+        exit_price = scores.get("exit_price")
+        if not exit_price:
+            return []
+        days = scores.get("exit_days")
+        timing = f", typically after {days:.0f} days" if days is not None else ""
+        lines = [f"🏁 Similar units left eBay at ~€{exit_price:.0f} "
+                 f"({scores.get('exit_n')} listings{timing}) — last asking price, not a confirmed sale"]
+        if scores.get("exit_mismatch"):
+            lines.append("   🧐 <b>Far from the market price</b> — this product may be misread, "
+                         "so check it's really what the title says.")
+        return lines
+
+    # ── Feedback buttons ─────────────────────────────────────────────
+
+    @staticmethod
+    def _feedback_row(item_id: Any, label: str = "") -> list[dict]:
+        """One row of feedback buttons, or none if the id won't fit in a button."""
+        row = []
+        for rating, emoji in FEEDBACK_BUTTONS:
+            data = f"fb:{rating}:{item_id}"
+            if len(data.encode()) > MAX_CALLBACK_BYTES:
+                return []
+            row.append({"text": f"{label}{emoji}", "callback_data": data})
+        return row
 
     # ── Listing age ──────────────────────────────────────────────────
 
@@ -304,6 +361,8 @@ class TelegramNotifier:
         if new_price and ebay_avg and ebay_avg > new_price * 1.05:
             lines.append(f"   ℹ️ eBay asking avg was €{ebay_avg:.0f} (used new price as the anchor)")
 
+        lines.extend(self._exit_lines(scores))
+
         age_line = self._age_line(scores)
         if age_line:
             lines.append(age_line)
@@ -353,7 +412,9 @@ class TelegramNotifier:
         if item_url:
             lines.extend(["", f"🔗 {self._link('View on eBay', item_url)}"])
 
-        return self._send_message("\n".join(lines))
+        row = self._feedback_row(listing.get("item_id", ""))
+        markup = {"inline_keyboard": [row]} if row and listing.get("item_id") else None
+        return self._send_message("\n".join(lines), reply_markup=markup)
 
     # ── Batched Good Deals Summary ───────────────────────────────────
 
@@ -420,6 +481,8 @@ class TelegramNotifier:
             line += " 📉"
         if (scores.get("listing_age_days") or 0) >= self.STALE_DAYS:
             line += " ♻️"
+        if scores.get("exit_mismatch"):
+            line += " 🧐"
         dupes = deal.get("duplicate_count", 0)
         if dupes:
             line += f"  <i>(+{dupes} similar)</i>"
@@ -437,36 +500,50 @@ class TelegramNotifier:
 
         total = len(deals)
         deals = self.collapse_duplicates(deals)
+        hidden = max(0, len(deals) - MAX_DIGEST_ROWS)
+        deals = deals[:MAX_DIGEST_ROWS]    # already sorted strongest first
         trusted = [d for d in deals if d.get("scores", {}).get("seller_trusted")]
         others = [d for d in deals if not d.get("scores", {}).get("seller_trusted")]
 
         headline = f"Found {total} good deal{'s' if total != 1 else ''}"
-        if len(deals) < total:
-            headline += f" across {len(deals)} product{'s' if len(deals) != 1 else ''}"
+        if len(deals) + hidden < total:
+            products = len(deals) + hidden
+            headline += f" across {products} product{'s' if products != 1 else ''}"
+        if hidden:
+            headline += f", best {len(deals)} shown"
         lines = [
             "📊 <b>eBay Deal Summary</b>",
             headline + ":",
         ]
 
         counter = 1
+        keyboard = []
+
+        def add_rows(section: list[dict[str, Any]]) -> None:
+            nonlocal counter
+            for deal in section:
+                lines.append(self._deal_line(counter, deal))
+                item_id = deal.get("listing", {}).get("item_id")
+                row = self._feedback_row(item_id, f"{counter} ") if item_id else []
+                if row:
+                    keyboard.append(row)
+                counter += 1
+
         if trusted:
             lines.extend(["", "⭐ <b>TRUSTED SELLERS</b> — established, 95%+ positive"])
-            for deal in trusted:
-                lines.append(self._deal_line(counter, deal))
-                counter += 1
+            add_rows(trusted)
 
         if others:
             lines.extend(["", "🔎 <b>OTHER SELLERS</b> — verify before buying"])
-            for deal in others:
-                lines.append(self._deal_line(counter, deal))
-                counter += 1
+            add_rows(others)
 
         lines.extend([
             "",
             "🤝 = Make Offer | 📷 = Stock photo | 📉 = price cut | 🔨 = auction",
             "🙈 = photos not checked by AI | 📝❌ = description not checked by AI | ♻️ = unsold 30+ days",
+            "🧐 = exit prices far from market, product may be misread",
         ])
-        return self._send_message("\n".join(lines))
+        return self._send_message("\n".join(lines), reply_markup={"inline_keyboard": keyboard} if keyboard else None)
 
     # ── Scan Report ──────────────────────────────────────────────────
 
@@ -503,7 +580,14 @@ class TelegramNotifier:
             )
         return lines
 
-    def send_daily_report(self, report: dict[str, Any], gaps: Optional[list[dict]] = None) -> bool:
+    def send_daily_report(
+        self,
+        report: dict[str, Any],
+        gaps: Optional[list[dict]] = None,
+        outcomes: Optional[dict[str, int]] = None,
+        feedback: Optional[dict[str, int]] = None,
+        mismatches: Optional[list[dict]] = None,
+    ) -> bool:
         """Send the running totals since the last report."""
         scans = report.get("scans", 0)
         per_scan = report.get("total_scanned", 0) / scans if scans else 0
@@ -515,9 +599,28 @@ class TelegramNotifier:
             f"🔥 Hot deals: {report.get('hot_deals', 0)}",
             f"👍 Good deals: {report.get('good_deals', 0)}",
             f"📸 Photo checks: {report.get('photo_checks', 0)}",
+            f"📡 eBay calls: {report.get('ebay_calls', 0):,} (limit 5,000 a day)",
         ]
         if report.get("errors"):
             lines.append(f"❌ Errors: {report['errors']}")
+        if report.get("failed_searches"):
+            lines.append(f"⚠️ eBay searches lost: {report['failed_searches']}")
+        if outcomes:
+            n = outcomes["alerts"]
+            lines.extend(["", f"⏱️ <b>How fast deals went</b> ({n} fixed-price alerts, 3-7 days old)"])
+            for hours in (6, 24, 72):
+                gone = outcomes[f"within_{hours}h"]
+                lines.append(f"  Gone within {hours}h: {gone} ({gone / n:.0%})")
+        if feedback:
+            lines.extend(["", "🗳️ <b>Your ratings so far:</b> " + " ".join(
+                f"{emoji} {feedback.get(rating, 0)}" for rating, emoji in FEEDBACK_BUTTONS)])
+        if mismatches:
+            lines.extend(["", "🧐 <b>Products to check</b> (exit prices far from market)"])
+            for m in mismatches:
+                lines.append(
+                    f"  {self._esc(m['product_key'])} ({self._esc(m['condition_band'])}): "
+                    f"left at ~€{m['exit_price']:.0f}, market €{m['market']:.0f}"
+                )
         lines.extend(self._gap_lines(gaps))
         return self._send_message("\n".join(lines))
 

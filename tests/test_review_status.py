@@ -12,7 +12,9 @@ def notifier(monkeypatch):
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
     n = TelegramNotifier()
     n.sent = []
-    n._send_message = lambda text, parse_mode="HTML": n.sent.append(text) or True
+    n.markups = []
+    n._send_message = lambda text, parse_mode="HTML", reply_markup=None: (
+        n.markups.append(reply_markup) or n.sent.append(text) or True)
     return n
 
 

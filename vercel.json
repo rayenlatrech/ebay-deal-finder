@@ -4,6 +4,10 @@
     "api/telegram.py": {
       "maxDuration": 120,
       "includeFiles": "{src,config}/**"
+    },
+    "api/health.py": {
+      "maxDuration": 30,
+      "includeFiles": "{src,config}/**"
     }
   }
 }

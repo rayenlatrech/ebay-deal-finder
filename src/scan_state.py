@@ -26,7 +26,11 @@ FULL_SCAN_SLACK_HOURS = 0.5
 # Forget a verdict after this long: analyses are reused for 30 days too.
 JUDGED_KEEP_DAYS = 30
 
-REPORT_COUNTERS = ("total_scanned", "hot_deals", "good_deals", "photo_checks", "errors")
+REPORT_COUNTERS = (
+    "total_scanned", "hot_deals", "good_deals", "photo_checks", "ebay_calls", "failed_searches", "errors",
+)
+
+_DIGEST_LISTING_FIELDS = ("item_id", "title", "price", "total_price", "item_url", "negotiable", "marketplace")
 
 
 def load_state(path: Optional[Path] = None) -> dict[str, Any]:
@@ -44,7 +48,7 @@ def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     target = Path(path or STATE_PATH)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+        target.write_text(json.dumps(state, separators=(",", ":"), default=str), encoding="utf-8")
     except OSError as e:
         logger.error("Failed to save scan state: %s", e)
 
@@ -128,6 +132,27 @@ def prune_judged(judged: dict[str, dict], now: datetime) -> dict[str, dict]:
         if at is not None and at >= cutoff:
             kept[item_id] = entry
     return kept
+
+
+def slim_deal(deal: dict) -> dict:
+    """The parts of a good deal its digest row needs, to wait in the state file."""
+    return {
+        "listing": {k: deal["listing"].get(k) for k in _DIGEST_LISTING_FIELDS},
+        "analysis": {"photo_type": deal.get("analysis", {}).get("photo_type", "")},
+        "scores": deal["scores"],
+    }
+
+
+def digest_due(state: dict[str, Any], now: datetime, hours_utc: list[int]) -> bool:
+    """True once a digest time has passed since the last digest went out."""
+    last = _parse(state.get("last_digest_at"))
+    if last is None or not hours_utc:
+        return False
+    slots = []
+    for hour in hours_utc:
+        slot = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        slots.append(slot if slot <= now else slot - timedelta(days=1))
+    return last < max(slots)
 
 
 def add_to_report(state: dict[str, Any], stats: dict[str, Any], now: datetime) -> None:

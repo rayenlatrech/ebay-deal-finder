@@ -93,6 +93,50 @@ def is_trusted_seller(
     return pct >= min_positive_pct and sales >= min_sales
 
 
+# Exit prices (the last asking price before a listing ended) are a proxy, so one
+# is only shown with this many behind it.
+MIN_EXIT_LISTINGS = 5
+# Across products, exit prices sit within about 0.82-1.25x the market price.
+# Far outside that usually means different products are sharing one key.
+EXIT_RATIO_LOW = 0.75
+EXIT_RATIO_HIGH = 1.4
+
+
+def exit_signal(stat: Optional[dict], baseline: float) -> dict[str, Any]:
+    """What a product's exit prices say about a listing's market price."""
+    if (not stat or not stat.get("median_price") or baseline <= 0
+            or (stat.get("sample_size") or 0) < MIN_EXIT_LISTINGS):
+        return {}
+    median = float(stat["median_price"])
+    ratio = median / baseline
+    return {
+        "exit_price": median,
+        "exit_n": stat["sample_size"],
+        "exit_days": stat.get("median_days_to_sell"),
+        "exit_mismatch": ratio < EXIT_RATIO_LOW or ratio > EXIT_RATIO_HIGH,
+    }
+
+
+def find_exit_mismatches(window_prices: dict, stats: dict, limit: int = 5) -> list[dict]:
+    """Products whose exit prices disagree most with their market price.
+
+    Args:
+        window_prices: Market prices keyed "product_key#band".
+        stats: Exit-price summaries keyed (product_key, band).
+    """
+    found = []
+    for (key, band), stat in stats.items():
+        market = window_prices.get(f"{key}#{band}")
+        if not market or market.n < 8:
+            continue
+        signal = exit_signal(stat, market.value)
+        if signal.get("exit_mismatch"):
+            found.append({"product_key": key, "condition_band": band, "market": market.value,
+                          "exit_price": signal["exit_price"], "ratio": signal["exit_price"] / market.value})
+    found.sort(key=lambda m: abs(m["ratio"] - 1), reverse=True)
+    return found[:limit]
+
+
 class DealScorer:
     """Scores listings by combining price, condition, seller, image, and quality signals."""
 

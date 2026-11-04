@@ -138,6 +138,14 @@ CREATE TABLE api_quotas (
     exhausted_until TIMESTAMPTZ
 );
 
+-- Your 👍 / 👎 / 🛒 on alerts
+CREATE TABLE alert_feedback (
+    listing_id  TEXT PRIMARY KEY,
+    rating      TEXT NOT NULL CHECK (rating IN ('up', 'down', 'bought')),
+    rated_at    TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE alert_feedback ENABLE ROW LEVEL SECURITY;
+
 -- Indexes for performance
 CREATE INDEX idx_price_history_key ON price_history(product_key);
 CREATE INDEX idx_analyses_listing ON analyses(listing_id);
@@ -222,7 +230,21 @@ schedule stays as a backup that skips itself when a scan ran in the last 65 minu
 3. *Test run* — expect HTTP **204**, and a new `workflow_dispatch` run in the
    Actions tab.
 
-### 7. Deal-check bot (Vercel, optional)
+### 7. Scan health warning (optional)
+
+A stopped scan can't report itself, so an hourly ping checks from outside GitHub
+and warns on Telegram after 3 hours without a scan.
+
+1. Vercel → Settings → Environment Variables → add `HEALTH_CHECK_SECRET` (any long
+   random value), then redeploy.
+2. **cron-job.org** → *Create cronjob*:
+   - URL: `https://<project>.vercel.app/api/health`
+   - Schedule: every hour, minute `30`
+   - Advanced → header `Authorization: Bearer <the same secret>`
+
+Message the bot `/status` at any time for the same check.
+
+### 8. Deal-check bot (Vercel, optional)
 
 Message the bot `iPhone 15 Pro 256GB usato 550€` (or paste an eBay link) and it
 replies with the market price, a verdict, the most to pay and an AI review. It

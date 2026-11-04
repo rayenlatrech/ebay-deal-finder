@@ -420,19 +420,164 @@ class Database:
             logger.error("Failed to finalize tracked listing %s: %s", item_id, e)
 
     def get_sold_comps_since(self, since_iso: str) -> list[dict]:
-        """Sold-proxy comps ended on/after `since_iso` (for the resale rollup)."""
+        """Sold-proxy comps ended on/after `since_iso` (for the resale rollup).
+
+        Paged: a single query stops at 1,000 rows, so the rollup silently left
+        out everything past that.
+        """
+        rows: list[dict] = []
+        PAGE = 1000
+        start = 0
         try:
-            resp = (
-                self.client.table("sold_comps")
-                .select("product_key, condition_band, final_price, days_active")
-                .gte("ended_at", since_iso)
-                .eq("sold_proxy", True)
-                .execute()
-            )
-            return resp.data or []
+            while True:
+                resp = (
+                    self.client.table("sold_comps")
+                    .select("product_key, condition_band, final_price, days_active")
+                    .gte("ended_at", since_iso)
+                    .eq("sold_proxy", True)
+                    .order("listing_id")
+                    .range(start, start + PAGE - 1)
+                    .execute()
+                )
+                batch = resp.data or []
+                rows.extend(batch)
+                if len(batch) < PAGE:
+                    return rows
+                start += PAGE
         except Exception as e:
             logger.error("Failed to load sold comps: %s", e)
             return []
+
+    def get_resale_stats(self) -> dict[tuple[str, str], dict]:
+        """Exit-price summaries, keyed by (product_key, condition_band)."""
+        try:
+            resp = (
+                self.client.table("resale_stats")
+                .select("product_key, condition_band, median_price, sample_size, median_days_to_sell")
+                .limit(1000)
+                .execute()
+            )
+            return {(r["product_key"], r["condition_band"]): r for r in (resp.data or [])}
+        except Exception as e:
+            logger.error("Failed to load resale stats: %s", e)
+            return {}
+
+    # ── Alert outcomes and feedback ───────────────────────────────────
+
+    def get_alerted_since(self, since_iso: str) -> dict[str, dict]:
+        """Listings alerted on since `since_iso`: id -> its latest analyzed_at and score."""
+        out: dict[str, dict] = {}
+        PAGE = 1000
+        start = 0
+        try:
+            while True:
+                resp = (
+                    self.client.table("analyses")
+                    .select("listing_id, analyzed_at, deal_score")
+                    .eq("alerted", True)
+                    .gte("analyzed_at", since_iso)
+                    .order("analyzed_at")
+                    .range(start, start + PAGE - 1)
+                    .execute()
+                )
+                batch = resp.data or []
+                for row in batch:
+                    out[row["listing_id"]] = row    # oldest first, so the latest wins
+                if len(batch) < PAGE:
+                    return out
+                start += PAGE
+        except Exception as e:
+            logger.error("Failed to load alerted listings: %s", e)
+            return {}
+
+    def get_tracked_rows(self, item_ids: list[str]) -> list[dict]:
+        """Active tracked rows for these listings."""
+        rows: list[dict] = []
+        CHUNK = 200
+        for start in range(0, len(item_ids), CHUNK):
+            try:
+                resp = (
+                    self.client.table("tracked_listings")
+                    .select("*")
+                    .in_("id", item_ids[start:start + CHUNK])
+                    .eq("status", "active")
+                    .execute()
+                )
+                rows.extend(resp.data or [])
+            except Exception as e:
+                logger.error("Failed to load tracked rows: %s", e)
+        return rows
+
+    def get_ended_times(self, item_ids: list[str]) -> dict[str, str]:
+        """When each of these listings was found to have ended, if it has."""
+        out: dict[str, str] = {}
+        CHUNK = 200
+        for start in range(0, len(item_ids), CHUNK):
+            try:
+                resp = (
+                    self.client.table("sold_comps")
+                    .select("listing_id, ended_at")
+                    .in_("listing_id", item_ids[start:start + CHUNK])
+                    .execute()
+                )
+                out.update({r["listing_id"]: r["ended_at"] for r in (resp.data or [])})
+            except Exception as e:
+                logger.error("Failed to load ended times: %s", e)
+        return out
+
+    def save_feedback(self, item_id: str, rating: str) -> bool:
+        """Store the owner's verdict on an alert; a changed mind replaces it."""
+        try:
+            self.client.table("alert_feedback").upsert({
+                "listing_id": item_id,
+                "rating": rating,
+                "rated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="listing_id").execute()
+            return True
+        except Exception as e:
+            logger.error("Failed to save feedback for %s: %s", item_id, e)
+            return False
+
+    def get_feedback_counts(self) -> dict[str, int]:
+        """How many alerts got each rating."""
+        counts: dict[str, int] = {}
+        PAGE = 1000
+        start = 0
+        try:
+            while True:
+                resp = (
+                    self.client.table("alert_feedback")
+                    .select("rating")
+                    .order("listing_id")
+                    .range(start, start + PAGE - 1)
+                    .execute()
+                )
+                batch = resp.data or []
+                for row in batch:
+                    counts[row["rating"]] = counts.get(row["rating"], 0) + 1
+                if len(batch) < PAGE:
+                    return counts
+                start += PAGE
+        except Exception as e:
+            logger.error("Failed to load feedback: %s", e)
+            return {}
+
+    def get_last_scan_time(self) -> Optional[datetime]:
+        """When a scan last recorded a listing; None if it can't be read."""
+        try:
+            resp = (
+                self.client.table("tracked_listings")
+                .select("last_seen")
+                .order("last_seen", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if not resp.data:
+                return None
+            return datetime.fromisoformat(resp.data[0]["last_seen"].replace("Z", "+00:00"))
+        except Exception as e:
+            logger.error("Failed to read the last scan time: %s", e)
+            return None
 
     def upsert_resale_stat(self, record: dict[str, Any]) -> None:
         """Insert or update one (product_key, condition_band) resale summary."""

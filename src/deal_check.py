@@ -230,7 +230,8 @@ HELP_TEXT = (
     "• <code>iPhone 15 Pro 256GB usato 550€</code>\n"
     "• <code>S24 Ultra 512GB come nuovo 600</code>\n"
     "• <code>PS5 slim sigillata 380 euro</code>\n"
-    "• an eBay link — I'll also check the description and photos"
+    "• an eBay link — I'll also check the description and photos\n\n"
+    "/status — is the scanner healthy?"
 )
 
 
@@ -448,7 +449,9 @@ def _photo_summary(image: dict) -> list[str]:
 MAX_UPDATE_AGE_S = 300
 
 
-def handle_update(update: dict, checker_factory, send, allowed_chat_id: str, now: Optional[float] = None) -> bool:
+def handle_update(
+    update: dict, checker_factory, send, allowed_chat_id: str, now: Optional[float] = None, status=None,
+) -> bool:
     """Process one Telegram update. Returns True if a reply was sent.
 
     Only the owner's chat is answered, and only fresh messages: after an
@@ -464,8 +467,11 @@ def handle_update(update: dict, checker_factory, send, allowed_chat_id: str, now
     text = (message.get("text") or message.get("caption") or "").strip()
     if not text:
         return False
-    if text.split()[0].split("@")[0] in ("/start", "/help"):
+    command = text.split()[0].split("@")[0]
+    if command in ("/start", "/help"):
         return send(HELP_TEXT)
+    if command == "/status" and status:
+        return send(status())
     try:
         reply = checker_factory().check(text)
     except Exception as e:  # never leave the user without an answer

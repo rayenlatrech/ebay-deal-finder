@@ -32,7 +32,7 @@ def main() -> int:
         resp = requests.post(f"{api}/setWebhook", json={
             "url": sys.argv[1],
             "secret_token": secret,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
             "drop_pending_updates": True,
         }, timeout=15)
     else:

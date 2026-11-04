@@ -29,15 +29,32 @@ def _make_checker():
     return DealChecker(db, AIAnalyzer(db), EbayClient())
 
 
+def _status() -> str:
+    from src.db import Database
+    from src.health import build_status
+
+    return build_status(Database())
+
+
 def _process(update: dict) -> None:
     from src.deal_check import handle_update
+    from src.feedback import handle_feedback
     from src.telegram_notifier import TelegramNotifier
 
     notifier = TelegramNotifier()
+    if update.get("callback_query"):
+        def save(item_id: str, rating: str) -> bool:
+            from src.db import Database
+
+            return Database().save_feedback(item_id, rating)
+
+        handle_feedback(update["callback_query"], save, notifier, notifier.chat_id)
+        return
+
     message = update.get("message") or {}
     if str((message.get("chat") or {}).get("id", "")) == notifier.chat_id:
         notifier.send_chat_action("typing")
-    handle_update(update, _make_checker, notifier._send_message, notifier.chat_id)
+    handle_update(update, _make_checker, notifier._send_message, notifier.chat_id, status=_status)
 
 
 class handler(BaseHTTPRequestHandler):
