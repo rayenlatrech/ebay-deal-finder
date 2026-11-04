@@ -488,11 +488,19 @@ def test_item_details_read_delivery_to_italy(options, ships, cost):
     assert details["shipping_to_buyer"] == cost
 
 
-def test_foreign_searches_stay_in_that_country_without_a_delivery_filter():
+def test_foreign_searches_cover_the_whole_eu_without_a_delivery_filter():
     from src.ebay_client import EbayClient
 
     client = EbayClient.__new__(EbayClient)
     client.marketplace = "EBAY_IT"
     sweeps = client._sweeps(["EBAY_DE"], "IT")
     assert sweeps[0] == ("EBAY_IT", "IT", None, False)
-    assert sweeps[1] == ("EBAY_DE", "DE", None, True)
+    assert sweeps[1] == ("EBAY_DE", None, None, True)
+
+    calls = []
+    client.search_listings = lambda **kw: calls.append(kw) or {"items": []}
+    client.search_all_categories([{"name": "c", "query": "q", "category_id": "1"}], foreign_marketplaces=["EBAY_DE"])
+    assert [c.get("item_location_region") for c in calls] == [None, "EUROPEAN_UNION"]
+    calls.clear()
+    client.search_ending_auctions([{"name": "c", "query": "q", "category_id": "1"}], 2, foreign_marketplaces=["EBAY_DE"])
+    assert [c.get("item_location_region") for c in calls] == [None, "EUROPEAN_UNION"]

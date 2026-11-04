@@ -20,6 +20,11 @@ OAUTH_SCOPE = "https://api.ebay.com/oauth/api_scope"
 # central Milan: eBay wants one, and costs vary little within a country.
 BUYER_CONTEXT = "contextualLocation=country%3DIT%2Czip%3D20121"
 
+# Foreign sites are searched for items anywhere in the EU. Unfiltered, over half
+# of the newest 200 on eBay.fr, and 40% on eBay.de, are stock from Australia or
+# China that the customs gate then throws away, wasting the search's depth.
+FOREIGN_ITEM_REGION = "EUROPEAN_UNION"
+
 
 class EbayClient:
     """Client for the eBay Browse API targeting eBay Italy."""
@@ -139,6 +144,7 @@ class EbayClient:
         marketplace: Optional[str] = None,
         item_location_country: Optional[str] = None,
         delivery_country: Optional[str] = None,
+        item_location_region: Optional[str] = None,
         buying_options: str = "FIXED_PRICE",
         sort: str = "newlyListed",
     ) -> dict[str, Any]:
@@ -147,8 +153,8 @@ class EbayClient:
         Args:
             marketplace: eBay site to search (defaults to the home marketplace).
             item_location_country: Restrict to items physically in this country.
-            delivery_country: Restrict to items that ship to this country — used
-                for cross-border marketplaces so we only see reachable listings.
+            delivery_country: Restrict to items eBay says ship to this country.
+            item_location_region: Restrict to items located in this eBay region.
 
         Returns dict with 'items' list and 'total' count.
         """
@@ -159,6 +165,8 @@ class EbayClient:
         filters = [f"buyingOptions:{{{buying_options}}}"]
         if item_location_country:
             filters.append(f"itemLocationCountry:{item_location_country}")
+        if item_location_region:
+            filters.append(f"itemLocationRegion:{item_location_region}")
         if delivery_country:
             filters.append(f"deliveryCountry:{delivery_country}")
 
@@ -395,9 +403,6 @@ class EbayClient:
         aren't filtered on delivery to ``ship_to_country``: the filter let through
         listings that don't deliver there anyway (36 of 40 checked), and the
         owner wants those too, flagged. get_item_details says which they are.
-        They are limited to items in that site's own country: otherwise over half
-        of the newest 200 on eBay.fr, and 40% on eBay.de, are stock from Australia
-        or China that the customs gate then throws away.
         """
         home_country = ship_to_country or "IT"
         sweeps: list[tuple[str, Optional[str], Optional[str], bool]] = [
@@ -405,7 +410,7 @@ class EbayClient:
         ]
         for mkt in (foreign_marketplaces or []):
             if mkt and mkt != self.marketplace:
-                sweeps.append((mkt, mkt.rsplit("_", 1)[-1], None, True))
+                sweeps.append((mkt, None, None, True))
         return sweeps
 
     def search_all_categories(
@@ -452,6 +457,7 @@ class EbayClient:
                             marketplace=marketplace,
                             item_location_country=loc_country,
                             delivery_country=delivery_country,
+                            item_location_region=FOREIGN_ITEM_REGION if is_foreign else None,
                         )
                     except Exception as e:
                         logger.error(
@@ -527,6 +533,7 @@ class EbayClient:
                             marketplace=marketplace,
                             item_location_country=loc_country,
                             delivery_country=delivery_country,
+                            item_location_region=FOREIGN_ITEM_REGION if is_foreign else None,
                             buying_options="AUCTION",
                             sort="endingSoonest",
                         )
