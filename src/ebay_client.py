@@ -16,6 +16,11 @@ AUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 OAUTH_SCOPE = "https://api.ebay.com/oauth/api_scope"
 
 
+# Where the buyer is, so item lookups answer for delivery there. The postcode is
+# central Milan: eBay wants one, and costs vary little within a country.
+BUYER_CONTEXT = "contextualLocation=country%3DIT%2Czip%3D20121"
+
+
 class EbayClient:
     """Client for the eBay Browse API targeting eBay Italy."""
 
@@ -71,29 +76,35 @@ class EbayClient:
         if "/buy/browse/" in response.url:
             self.browse_calls += 1
 
-    def _get_headers(self, marketplace: Optional[str] = None) -> dict[str, str]:
+    def _get_headers(self, marketplace: Optional[str] = None, buyer_in_italy: bool = False) -> dict[str, str]:
         """Build request headers with auth and the target marketplace.
 
         The marketplace header must match the site a listing belongs to —
         querying a German item with the Italian header can wrongly 404.
+        With buyer_in_italy, an item lookup answers for delivery to Italy, not
+        to the listing's own country.
         """
-        return {
+        headers = {
             "Authorization": f"Bearer {self._get_access_token()}",
             "X-EBAY-C-MARKETPLACE-ID": marketplace or self.marketplace,
             "Content-Type": "application/json",
         }
+        if buyer_in_italy:
+            headers["X-EBAY-C-ENDUSERCTX"] = BUYER_CONTEXT
+        return headers
 
     # ── API Calls with Retry ─────────────────────────────────────────
 
     def _api_get(
-        self, url: str, params: Optional[dict] = None, marketplace: Optional[str] = None
+        self, url: str, params: Optional[dict] = None, marketplace: Optional[str] = None,
+        buyer_in_italy: bool = False,
     ) -> dict:
         """Make a GET request with exponential backoff on rate limits."""
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 resp = self.session.get(
-                    url, headers=self._get_headers(marketplace), params=params, timeout=30
+                    url, headers=self._get_headers(marketplace, buyer_in_italy), params=params, timeout=30
                 )
                 if resp.status_code == 429:
                     wait = min(2 ** (attempt + 1), 30)
@@ -258,7 +269,7 @@ class EbayClient:
         url = f"{BROWSE_API_BASE}/item/{item_id}"
 
         try:
-            data = self._api_get(url, marketplace=marketplace)
+            data = self._api_get(url, marketplace=marketplace, buyer_in_italy=True)
         except Exception as e:
             logger.error("Failed to get item details for %s: %s", item_id, e)
             return None
@@ -274,17 +285,23 @@ class EbayClient:
             all_image_urls.extend(img.get("imageUrl", "") for img in additional_images)
             all_image_urls = [url for url in all_image_urls if url]
 
-            # Cheapest shipping option; the scan keeps its own figure from the
-            # search results, the deal check needs this one.
+            # Asked as a buyer in Italy, so these are delivery options to Italy:
+            # none at all means the listing doesn't deliver there.
+            shipping_options = data.get("shippingOptions", []) or []
             shipping_costs = []
-            for option in data.get("shippingOptions", []) or []:
+            for option in shipping_options:
+                # A calculated rate has no figure here: unknown, not free.
+                value = (option.get("shippingCost") or {}).get("value")
                 try:
-                    shipping_costs.append(float((option.get("shippingCost") or {}).get("value", 0)))
+                    if value is not None:
+                        shipping_costs.append(float(value))
                 except (TypeError, ValueError):
                     pass
 
             details = {
                 "shipping_cost": min(shipping_costs) if shipping_costs else 0.0,
+                "ships_to_buyer": bool(shipping_options),
+                "shipping_to_buyer": min(shipping_costs) if shipping_costs else None,
                 # getItem has no itemOriginDate, only this listing's start.
                 "creation_date": data.get("itemCreationDate", ""),
                 "item_id": data.get("itemId", item_id),
@@ -374,8 +391,13 @@ class EbayClient:
     ) -> list[tuple[str, Optional[str], Optional[str], bool]]:
         """(marketplace, item_location_country, delivery_country, is_foreign) per site.
 
-        The home site is searched for domestically-located items; each foreign
-        site for items that ship to ``ship_to_country``.
+        The home site is searched for domestically-located items. Foreign sites
+        aren't filtered on delivery to ``ship_to_country``: the filter let through
+        listings that don't deliver there anyway (36 of 40 checked), and the
+        owner wants those too, flagged. get_item_details says which they are.
+        They are limited to items in that site's own country: otherwise over half
+        of the newest 200 on eBay.fr, and 40% on eBay.de, are stock from Australia
+        or China that the customs gate then throws away.
         """
         home_country = ship_to_country or "IT"
         sweeps: list[tuple[str, Optional[str], Optional[str], bool]] = [
@@ -383,7 +405,7 @@ class EbayClient:
         ]
         for mkt in (foreign_marketplaces or []):
             if mkt and mkt != self.marketplace:
-                sweeps.append((mkt, None, home_country, True))
+                sweeps.append((mkt, mkt.rsplit("_", 1)[-1], None, True))
         return sweeps
 
     def search_all_categories(

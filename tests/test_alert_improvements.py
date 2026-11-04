@@ -419,3 +419,80 @@ def test_health_endpoint_needs_the_secret(monkeypatch):
         assert calls == [1]
     finally:
         httpd.shutdown()
+
+
+# ── Delivery to Italy ──────────────────────────────────────────────────
+
+_DE = {"item_id": ITEM, "title": "t", "price": 102, "total_price": 108, "shipping_cost": 6}
+
+
+def test_no_delivery_is_flagged_with_the_local_price_only(notifier):
+    notifier.send_hot_deal_alert(_DE, {}, {"deal_score": 85, "ships_to_italy": False, "is_foreign": True})
+    text = notifier.sent[0][0]
+    assert "No delivery to Italy listed" in text and "€102 + €6 local delivery" in text
+    assert "friend" in text and "forwarding" in text
+    assert "Ships to Italy" not in text and "ships to Italy" not in text
+
+
+def test_delivery_to_italy_shows_the_sum(notifier):
+    listing = {**_DE, "price": 200, "total_price": 230, "shipping_cost": 30}
+    notifier.send_hot_deal_alert(listing, {}, {"deal_score": 85, "ships_to_italy": True})
+    assert "Ships to Italy: €200 + €30 delivery = <b>€230</b>" in notifier.sent[0][0]
+
+
+def test_free_delivery_and_unknown_delivery(notifier):
+    notifier.send_hot_deal_alert({**_DE, "shipping_cost": 0}, {}, {"deal_score": 85, "ships_to_italy": True})
+    assert "🚚 Ships to Italy" in notifier.sent[0][0] and " + €0" not in notifier.sent[0][0]
+    # The lookup failed: don't claim either way.
+    notifier.send_hot_deal_alert(_DE, {}, {"deal_score": 85, "ships_to_italy": None, "is_foreign": True})
+    assert "Ships to Italy" not in notifier.sent[1][0] and "No delivery" not in notifier.sent[1][0]
+
+
+def test_digest_marks_rows_and_prefers_a_listing_that_ships_on_a_tie(notifier):
+    def deal(item_id, ships):
+        d = _deal(item_id, key="same")
+        d["scores"]["ships_to_italy"] = ships
+        return d
+
+    notifier.send_deal_summary([deal("no", False), deal("yes", True)])
+    text = notifier.sent[0][0]
+    assert "tyes" in text and "tno" not in text
+    notifier.send_deal_summary([deal("no", False)])
+    assert "🚫" in notifier.sent[1][0].split("OTHER SELLERS")[1].splitlines()[1]
+
+
+def test_item_lookup_asks_as_a_buyer_in_italy():
+    from src.ebay_client import BUYER_CONTEXT, EbayClient
+
+    client = EbayClient.__new__(EbayClient)
+    client.marketplace = "EBAY_IT"
+    client._get_access_token = lambda: "tok"
+    assert "X-EBAY-C-ENDUSERCTX" not in client._get_headers("EBAY_DE")
+    assert client._get_headers("EBAY_DE", buyer_in_italy=True)["X-EBAY-C-ENDUSERCTX"] == BUYER_CONTEXT
+    assert "country%3DIT" in BUYER_CONTEXT
+
+
+@pytest.mark.parametrize("options,ships,cost", [
+    ([], False, None),
+    ([{"shippingCost": {"value": "29.99"}}, {"shippingCost": {"value": "19.99"}}], True, 19.99),
+    ([{"shippingCostType": "CALCULATED"}], True, None),
+])
+def test_item_details_read_delivery_to_italy(options, ships, cost):
+    from src.ebay_client import EbayClient
+
+    client = EbayClient.__new__(EbayClient)
+    client.marketplace = "EBAY_IT"
+    client._api_get = lambda *a, **k: {"shippingOptions": options, "price": {"value": "100"}}
+    details = client.get_item_details("x", marketplace="EBAY_DE")
+    assert details["ships_to_buyer"] is ships
+    assert details["shipping_to_buyer"] == cost
+
+
+def test_foreign_searches_stay_in_that_country_without_a_delivery_filter():
+    from src.ebay_client import EbayClient
+
+    client = EbayClient.__new__(EbayClient)
+    client.marketplace = "EBAY_IT"
+    sweeps = client._sweeps(["EBAY_DE"], "IT")
+    assert sweeps[0] == ("EBAY_IT", "IT", None, False)
+    assert sweeps[1] == ("EBAY_DE", "DE", None, True)

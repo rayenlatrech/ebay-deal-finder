@@ -27,7 +27,8 @@ FULL_SCAN_SLACK_HOURS = 0.5
 JUDGED_KEEP_DAYS = 30
 
 REPORT_COUNTERS = (
-    "total_scanned", "hot_deals", "good_deals", "photo_checks", "ebay_calls", "failed_searches", "errors",
+    "total_scanned", "hot_deals", "good_deals", "ships_to_italy", "no_delivery",
+    "photo_checks", "ebay_calls", "failed_searches", "errors",
 )
 
 _DIGEST_LISTING_FIELDS = ("item_id", "title", "price", "total_price", "item_url", "negotiable", "marketplace")

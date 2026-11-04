@@ -203,6 +203,25 @@ class TelegramNotifier:
                          "so check it's really what the title says.")
         return lines
 
+    # ── Delivery ─────────────────────────────────────────────────────
+
+    NO_DELIVERY_HINT = "Ask the seller, or use a friend or a forwarding service."
+
+    def _delivery_lines(self, listing: dict[str, Any], scores: dict[str, Any]) -> list[str]:
+        """Whether this reaches Italy, and what's in the price either way."""
+        ships = scores.get("ships_to_italy")
+        shipping = listing.get("shipping_cost", 0) or 0
+        item = listing.get("price", 0) or 0
+        if ships is False:
+            local = f"€{item:.0f} + €{shipping:.0f} local delivery" if shipping else f"€{item:.0f} before delivery"
+            return [f"🚫 <b>No delivery to Italy listed</b> — {local}.", f"   {self.NO_DELIVERY_HINT}"]
+        if ships is True:
+            if shipping:
+                return [f"🚚 Ships to Italy: €{item:.0f} + €{shipping:.0f} delivery = "
+                        f"<b>€{item + shipping:.0f}</b>"]
+            return ["🚚 Ships to Italy"]
+        return [f"   📦 incl. €{shipping:.0f} shipping"] if shipping else []
+
     # ── Feedback buttons ─────────────────────────────────────────────
 
     @staticmethod
@@ -312,7 +331,6 @@ class TelegramNotifier:
         # Show the total actually paid — the discount is computed on it, so
         # displaying the base price alone made the maths look wrong.
         price = listing.get("total_price") or listing.get("price", 0)
-        shipping = listing.get("shipping_cost", 0) or 0
         avg_price = scores.get("avg_price", 0)
         discount_pct = scores.get("discount_pct", 0)
         new_price = scores.get("new_price")
@@ -325,7 +343,7 @@ class TelegramNotifier:
         if scores.get("seller_trusted"):
             header += "  ⭐ <b>TRUSTED SELLER</b>"
         if scores.get("is_foreign"):
-            header += f"\n🌍 Cross-border {flag} — ships to Italy"
+            header += f"\n🌍 Cross-border {flag}"
 
         lines = [
             header,
@@ -345,8 +363,7 @@ class TelegramNotifier:
                     f"   💡 <b>Bid up to €{max_bid:.0f}</b> — still a deal at that price. "
                     f"Enter it as your max bid and eBay bids for you."
                 )
-        if shipping:
-            lines.append(f"   📦 incl. €{shipping:.0f} shipping")
+        lines.extend(self._delivery_lines(listing, scores))
         drop = scores.get("price_drop_pct")
         original = scores.get("original_price")
         if drop and original:
@@ -440,7 +457,8 @@ class TelegramNotifier:
         def strength(d: dict[str, Any]) -> tuple:
             s, li = d.get("scores", {}), d.get("listing", {})
             price = li.get("total_price") or li.get("price") or 0
-            return (-int(s.get("deal_score", 0)), float(price))
+            # On equal scores, keep the one that can reach Italy.
+            return (-int(s.get("deal_score", 0)), s.get("ships_to_italy") is False, float(price))
 
         collapsed: list[dict[str, Any]] = []
         for members in groups.values():
@@ -465,6 +483,8 @@ class TelegramNotifier:
         flag = self._flag(scores.get("marketplace", ""))
 
         link = self._link(title, url) if url else self._esc(title)
+        if scores.get("ships_to_italy") is False:
+            link = f"🚫 {link}"
         line = f"{index}. {flag} {link} — €{price:.0f} ({discount:.0f}% off) — Score: {score}"
 
         if listing.get("negotiable"):
@@ -542,6 +562,7 @@ class TelegramNotifier:
             "🤝 = Make Offer | 📷 = Stock photo | 📉 = price cut | 🔨 = auction",
             "🙈 = photos not checked by AI | 📝❌ = description not checked by AI | ♻️ = unsold 30+ days",
             "🧐 = exit prices far from market, product may be misread",
+            f"🚫 = no delivery to Italy listed. {self.NO_DELIVERY_HINT}",
         ])
         return self._send_message("\n".join(lines), reply_markup={"inline_keyboard": keyboard} if keyboard else None)
 
@@ -598,6 +619,8 @@ class TelegramNotifier:
             f"🔍 Listings per scan: ~{per_scan:,.0f}",
             f"🔥 Hot deals: {report.get('hot_deals', 0)}",
             f"👍 Good deals: {report.get('good_deals', 0)}",
+            f"🚚 Of those: {report.get('ships_to_italy', 0)} ship to Italy, "
+            f"🚫 {report.get('no_delivery', 0)} don't",
             f"📸 Photo checks: {report.get('photo_checks', 0)}",
             f"📡 eBay calls: {report.get('ebay_calls', 0):,} (limit 5,000 a day)",
         ]

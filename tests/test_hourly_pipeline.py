@@ -41,6 +41,7 @@ class World:
         self.reports = []
         self.gemini_keys = ["key"]
         self.image_fails = False
+        self.delivery = {}
         self.hot_send_fails = False
         self.summary_fails = False
         self.ended = set()
@@ -119,7 +120,7 @@ def world(monkeypatch, tmp_path):
 
         def get_item_details(self, item_id, marketplace=None):
             w.calls["item"].append(item_id)
-            return {"short_description": "Ottime condizioni, batteria 90%"}
+            return {"short_description": "Ottime condizioni, batteria 90%", **w.delivery.get(item_id, {})}
 
         def item_is_active(self, item_id, marketplace=None):
             return item_id not in w.ended
@@ -433,6 +434,47 @@ def test_many_lost_searches_raise_an_alarm(world, monkeypatch):
     world.listings = [_listing("a")]
     run_pipeline()
     assert "refused 10 searches" in errors[0]
+
+
+def test_listing_without_delivery_to_italy_still_alerts_at_its_own_price(world):
+    world.listings = [_listing("de", shipping_cost=6.0)]
+    world.delivery["de"] = {"ships_to_buyer": False, "shipping_to_buyer": None}
+    seen = []
+    original = src.telegram_notifier.TelegramNotifier.send_hot_deal_alert
+    src.telegram_notifier.TelegramNotifier.send_hot_deal_alert = (
+        lambda self, listing, analysis, scores: seen.append((listing, scores)) or original(self, listing, analysis, scores))
+    try:
+        run_pipeline()
+    finally:
+        src.telegram_notifier.TelegramNotifier.send_hot_deal_alert = original
+    assert world.sent == ["de"]
+    listing, scores = seen[0]
+    assert scores["ships_to_italy"] is False
+    assert listing["shipping_cost"] == 6.0        # no made-up forwarding cost
+
+
+def test_delivered_price_replaces_the_local_one_and_can_end_a_deal(world):
+    # 12% off before delivery, 7% off after: under the 10% minimum.
+    world.listings = [_listing("de", price=528.0)]
+    world.delivery["de"] = {"ships_to_buyer": True, "shipping_to_buyer": 30.0}
+    run_pipeline()
+    assert world.calls["item"] == ["de"]
+    assert world.calls["text"] == []
+    assert world.sent == [] and _queued() == {}
+    _reset_calls(world)
+
+    # Judged at that price, so it isn't looked up again every hour.
+    run_pipeline()
+    assert world.calls["item"] == []
+
+
+def test_delivered_price_lowers_the_score_of_a_listing_that_ships(world):
+    world.listings = [_listing("free", price=450.0), _listing("paid", price=450.0)]
+    world.delivery["paid"] = {"ships_to_buyer": True, "shipping_to_buyer": 10.0}
+    run_pipeline()
+    queued = _queued()
+    assert queued["paid"]["scores"]["discount_pct"] < queued["free"]["scores"]["discount_pct"]
+    assert queued["paid"]["scores"]["ships_to_italy"] is True
 
 
 def test_full_scan_runs_again_after_four_hours(world):

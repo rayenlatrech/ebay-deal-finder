@@ -169,6 +169,8 @@ def run_pipeline() -> None:
         "skipped": 0,
         "errors": 0,
         "photo_checks": 0,
+        "ships_to_italy": 0,
+        "no_delivery": 0,
     }
 
     scan_started = datetime.now(timezone.utc)
@@ -594,11 +596,43 @@ def run_pipeline() -> None:
                 )
                 if details:
                     shipping = listing.get("shipping_cost", 0.0) or 0.0
+                    search_price = listing.get("price")
+                    home_url = listing.get("item_url")
                     listing.update(details)
-                    # get_item_details overwrites `price` but carries no shipping,
-                    # so recompute the total to keep the two consistent.
+                    # The lookup returns the listing's own-site link and, for an
+                    # auction, may not return the current bid.
+                    if listing.get("original_item_url"):
+                        listing["item_url"] = home_url
+                    if listing.get("is_auction"):
+                        listing["price"] = search_price
+                    # What delivery to Italy costs, where the listing offers it.
+                    # One that doesn't is only flagged: the owner decides whether
+                    # a friend, the seller or a forwarder can get it there.
+                    delivered = details.get("shipping_to_buyer")
+                    if delivered is not None:
+                        shipping = delivered
                     listing["shipping_cost"] = shipping
                     listing["total_price"] = float(listing.get("price", 0)) + shipping
+
+                    # Judge what the buyer would really pay.
+                    if delivered is not None:
+                        cat_cfg = category_config.get(listing.get("category", ""), {})
+                        min_discount = cat_cfg.get("min_discount", global_min_discount)
+                        price_score, discount_pct, is_suspicious = scorer.calculate_price_score(
+                            listing["total_price"], candidate["avg_price"], cat_cfg.get("price_scores")
+                        )
+                        candidate.update(price_score=price_score, discount_pct=discount_pct,
+                                         is_suspicious=is_suspicious,
+                                         rank_score=price_score * candidate["priority"])
+                        max_bid = None
+                        if listing.get("is_auction"):
+                            max_bid = round(candidate["avg_price"] * (1 - min_discount / 100) - shipping)
+                        candidate["max_bid"] = max_bid
+                        if discount_pct < min_discount or (max_bid is not None and max_bid <= float(listing.get("price") or 0)):
+                            logger.info("Skipping %s: not a deal once delivered to Italy", listing["item_id"])
+                            stats["skipped"] += 1
+                            record_verdict(judged, candidate, now_utc)
+                            continue
 
                 # Enrich listing with price context for the AI prompt
                 listing["avg_price"] = candidate["avg_price"]
@@ -851,6 +885,7 @@ def run_pipeline() -> None:
                     "text_reviewed": not text_analysis.get("text_ai_failed", False),
                     "listing_age_days": round(age_days, 2) if age_days is not None else None,
                     "relisted": relisted,
+                    "ships_to_italy": listing.get("ships_to_buyer"),
                     **exit_signal(
                         resale_stats.get((candidate["product_key"], candidate["band"])),
                         candidate["avg_price"],
@@ -873,7 +908,8 @@ def run_pipeline() -> None:
 
                 # A full scan can re-score a deal already waiting for a digest.
                 was_queued = pending_digest.pop(listing["item_id"], None) is not None
-                delivered = True
+                alert_sent = True
+                ships = listing.get("ships_to_buyer")
 
                 # ── Step 7: Send Alerts ──────────────────────────────
                 if deal_class == "hot_deal":
@@ -882,8 +918,8 @@ def run_pipeline() -> None:
                         listing["title"][:40], listing["price"],
                         candidate["discount_pct"], deal_score,
                     )
-                    delivered = telegram.send_hot_deal_alert(listing, full_analysis, scores)
-                    if delivered:
+                    alert_sent = telegram.send_hot_deal_alert(listing, full_analysis, scores)
+                    if alert_sent:
                         db.mark_alerted(listing["item_id"])
                     else:
                         logger.warning("Hot deal alert failed to send — it stays unjudged for a retry")
@@ -893,6 +929,8 @@ def run_pipeline() -> None:
                         "scores": scores,
                     })
                     stats["hot_deals"] += 1
+                    if ships is not None:
+                        stats["ships_to_italy" if ships else "no_delivery"] += 1
 
                 elif deal_class == "good_deal":
                     logger.info(
@@ -914,6 +952,8 @@ def run_pipeline() -> None:
                     if not was_queued:
                         good_deals.append(deal)
                         stats["good_deals"] += 1
+                        if ships is not None:
+                            stats["ships_to_italy" if ships else "no_delivery"] += 1
 
                 elif deal_class == "log_only":
                     stats["logged"] += 1
@@ -923,7 +963,7 @@ def run_pipeline() -> None:
 
                 # A failed text review or alert stays unjudged so the next scan
                 # retries it.
-                if delivered and not text_analysis.get("text_ai_failed"):
+                if alert_sent and not text_analysis.get("text_ai_failed"):
                     record_verdict(
                         judged, candidate, now_utc,
                         needs_photo=could_alert and image_status in ("skipped_limit", "ai_failed"),
